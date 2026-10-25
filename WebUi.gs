@@ -8,6 +8,7 @@ function doGet() {
 function publicJevSettings_(config) {
   return {
     enabled: config.enabled, scope: config.scope, intervalMinutes: config.intervalMinutes,
+    providers: config.providers.map(function (p) { return { id: p.id, apiUrl: p.apiUrl, model: p.model, apiKeyConfigured: Boolean(p.apiKey) }; }),
     model: config.model, apiUrl: config.apiUrl, schedule: {
       weekdays: config.schedule.weekdays.slice(), startTime: config.schedule.startTime,
       endTime: config.schedule.endTime, timeZone: config.schedule.timeZone,
@@ -33,7 +34,7 @@ function getJevUiState() {
     try { running = properties[JEV_RUNNING_PROPERTY_] ? JSON.parse(properties[JEV_RUNNING_PROPERTY_]) : null; } catch (ignored) {}
     if (running && Date.now() - Number(running.startedAt) > 7 * 60 * 1000) running = Object.assign({}, running, { outcome: 'interrupted', expired: true });
     return {
-      ok: true, revision: config.revision, settings: publicJevSettings_(config), apiKeyConfigured: Boolean(config.apiKey),
+      ok: true, revision: config.revision, settings: publicJevSettings_(config), apiKeyConfigured: config.providers.some(function (p) { return Boolean(p.apiKey); }),
       triggerHealth: getJevTriggerHealth_(config), cooldown: getJevCooldownState_(), running: running,
       lastRuns: history.slice(-20).reverse(), bounds: {
         intervals: JEV_SUPPORTED_INTERVALS_, fetch: [1, 100], classify: [1, 100], threshold: [0, 1],
@@ -90,10 +91,36 @@ function saveJevSettings(request) {
     const action = request.apiKeyAction || 'keep';
     if (['keep', 'replace', 'clear'].indexOf(action) < 0) return { ok: false, code: 'VALIDATION', errors: [{ path: 'apiKeyAction', message: 'Choose keep, replace, or clear.' }] };
     const rawSettings = request.settings || {};
-    const allowedTop = ['enabled', 'scope', 'intervalMinutes', 'model', 'apiUrl', 'schedule', 'defaultThreshold', 'fallbackLabel', 'categories', 'advanced'];
+    const allowedTop = ['enabled', 'scope', 'intervalMinutes', 'model', 'apiUrl', 'providers', 'schedule', 'defaultThreshold', 'fallbackLabel', 'categories', 'advanced'];
     const forbidden = ['apiKey', 'apiKeyConfigured', 'revision', 'schemaVersion', 'running', 'triggerHealth', 'cooldown', 'lastRuns'];
     if (Object.keys(rawSettings).some(function (k) { return allowedTop.indexOf(k) < 0 || forbidden.indexOf(k) >= 0; })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'settings', message: 'Settings include unsupported or secret fields.' }] };
     const next = Object.assign({}, rawSettings, { schemaVersion: 1, revision: current.revision + 1 });
+    if (rawSettings.providers !== undefined) {
+      if (!Array.isArray(rawSettings.providers) || rawSettings.providers.some(function (p) { return !p || typeof p !== 'object' || Array.isArray(p) || Object.keys(p).some(function (k) { return ['id','apiUrl','model','apiKeyConfigured'].indexOf(k) < 0; }); })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'providers', message: 'Provider profiles include unsupported fields.' }] };
+      const actions = request.providerKeyActions || {};
+      if (!actions || typeof actions !== 'object' || Array.isArray(actions) || Object.keys(actions).some(function (id) { return !rawSettings.providers.some(function (p) { return p.id === id; }); })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'providerKeyActions', message: 'Provider key actions are invalid.' }] };
+      const suppliedKeys = request.providerKeys || {};
+      if (!suppliedKeys || typeof suppliedKeys !== 'object' || Array.isArray(suppliedKeys) || Object.keys(suppliedKeys).some(function (id) { return !rawSettings.providers.some(function (p) { return p.id === id; }); }) || Object.keys(suppliedKeys).some(function (id) { return typeof suppliedKeys[id] !== 'string'; })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'providerKeys', message: 'Provider keys are invalid.' }] };
+      next.providers = rawSettings.providers.map(function (p) {
+        const actionForProvider = Object.prototype.hasOwnProperty.call(actions, p.id) ? actions[p.id] : 'keep';
+        if (['keep','replace','clear'].indexOf(actionForProvider) < 0) throw new Error('Provider key action is invalid.');
+        const currentProvider = current.providers.filter(function (x) { return x.id === p.id; })[0];
+        const suppliedKey = Object.prototype.hasOwnProperty.call(suppliedKeys, p.id) ? suppliedKeys[p.id] : '';
+        const key = actionForProvider === 'replace' ? String(suppliedKey || '').trim() : actionForProvider === 'clear' ? '' : (currentProvider ? currentProvider.apiKey : '');
+        if (actionForProvider === 'replace' && !key) throw new Error('Provider API key replacement must not be empty.');
+        return { id: p.id, apiUrl: p.apiUrl, model: p.model, apiKey: key };
+      });
+      if (!Object.keys(actions).length && action !== 'keep') {
+        const legacyKey = action === 'clear' ? '' : String(request.apiKey || '').trim();
+        if (action === 'replace' && !legacyKey) throw new Error('Provider API key replacement must not be empty.');
+        next.providers[0].apiKey = legacyKey;
+      }
+      next.apiKey = ''; next.apiUrl = next.providers[0] && next.providers[0].apiUrl; next.model = next.providers[0] && next.providers[0].model;
+    } else {
+      next.providers = current.providers.map(function (p, i) { return { id:p.id, apiUrl:i===0?rawSettings.apiUrl:p.apiUrl, model:i===0?rawSettings.model:p.model, apiKey:p.apiKey }; });
+      if (action !== 'keep') next.providers[0].apiKey = action === 'clear' ? '' : String(request.apiKey || '').trim();
+      next.apiKey = next.providers[0].apiKey;
+    }
     next.schedule = Object.assign({}, rawSettings.schedule);
     next.categories = Array.isArray(rawSettings.categories) && rawSettings.categories.every(function (c) { return c && typeof c === 'object' && !Array.isArray(c); }) ? rawSettings.categories.map(function (c) {
       if (Object.keys(c).some(function (k) { return ['key', 'label', 'description', 'enabled', 'threshold'].indexOf(k) < 0; })) throw new Error('Settings include unsupported category fields.');
@@ -102,12 +129,12 @@ function saveJevSettings(request) {
     if (!rawSettings.schedule || Object.keys(rawSettings.schedule).some(function (k) { return ['weekdays', 'startTime', 'endTime', 'timeZone'].indexOf(k) < 0; })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'schedule', message: 'Schedule includes unsupported fields.' }] };
     if (!rawSettings.advanced || Object.keys(rawSettings.advanced).some(function (k) { return ['maxThreadsToFetch', 'maxThreadsToClassify', 'batchTargetTokens', 'maxRequestTokens', 'maxStateQuestionTokens', 'providerAttempts', 'initialRetryDelayMs', 'gmailSpacingMs', 'cooldownMinutes'].indexOf(k) < 0; })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'advanced', message: 'Advanced settings include unsupported fields.' }] };
     next.advanced = rawSettings.advanced;
-    next.apiKey = action === 'replace' ? String(request.apiKey || '').trim() : action === 'clear' ? '' : current.apiKey;
+    if (!next.providers) next.apiKey = action === 'replace' ? String(request.apiKey || '').trim() : action === 'clear' ? '' : current.apiKey;
     const validated = validateJevConfig_(next, { apiKeyAction: action });
     commitJevConfig_(validated);
     let schedulePending = false;
     try { reconcileJevTrigger_(validated.intervalMinutes, false); } catch (ignoredScheduleError) { schedulePending = true; }
-    return { ok: true, saved: true, revision: validated.revision, settings: publicJevSettings_(validated), apiKeyConfigured: Boolean(validated.apiKey), schedulePending: schedulePending };
+    return { ok: true, saved: true, revision: validated.revision, settings: publicJevSettings_(validated), apiKeyConfigured: validated.providers.some(function (p) { return Boolean(p.apiKey); }), schedulePending: schedulePending };
   } catch (error) { return webResultError_(error); }
   finally { try { lock.releaseLock(); } catch (ignoredReleaseError) {} }
 }
