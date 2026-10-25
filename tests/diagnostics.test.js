@@ -260,10 +260,12 @@ function createHarness(options) {
         const payload = JSON.parse(requestOptions.payload);
         capturedRequests.push({ url: url, options: requestOptions, payload: payload });
         if (settings.fetchError) throw settings.fetchError;
+        const fetchSpec = settings.fetchSequence && settings.fetchSequence[counters.fetches - 1] || {};
         return {
-          getResponseCode: function () { return settings.fetchStatus || 200; },
+          getResponseCode: function () { return fetchSpec.status || settings.fetchStatus || 200; },
           getContentText: function () {
             if (settings.responseBodyReadError) throw new Error(settings.responseBodyReadError);
+            if (Object.prototype.hasOwnProperty.call(fetchSpec, 'body')) return typeof fetchSpec.body === 'string' ? fetchSpec.body : JSON.stringify(fetchSpec.body);
             if (Object.prototype.hasOwnProperty.call(settings, 'httpErrorBody')) return settings.httpErrorBody;
             if (settings.responseFactory) {
               return JSON.stringify(settings.responseFactory(payload, counters.fetches));
@@ -325,7 +327,7 @@ function createHarness(options) {
   vm.runInContext(source, context, { filename: 'jev-apps-script.js' });
 
   return {
-    run: function () { vm.runInContext('runJevBatch()', context); },
+    run: function () { return vm.runInContext('runJevBatch()', context); },
     runNow: function () { return vm.runInContext('runJevNow()', context); },
     installTrigger: function () { return vm.runInContext('installJevTrigger()', context); },
     evaluate: function (script) { return vm.runInContext(script, context); },
@@ -926,6 +928,169 @@ test('UI state exposes a configured-key flag without returning the API key', fun
   assert.equal(state.apiKeyConfigured, true);
   assert.ok(!JSON.stringify(state).includes(API_KEY));
   assert.equal(state.settings.fallbackLabel, 'Jev-Uncategoried');
+});
+
+test('provider profiles in public UI state expose metadata and key flags but never credentials', function () {
+  const harness = createHarness();
+  const profiles = [
+    { id: 'primary', apiUrl: 'https://primary.example/v1', model: 'model-a', apiKey: 'primary-private-key' },
+    { id: 'backup', apiUrl: 'https://backup.example/v2', model: 'model-b', apiKey: 'backup-private-key' },
+  ];
+  harness.evaluate('var c = getJevConfig_(); c.providers = ' + JSON.stringify(profiles) + '; c.enabled = true; commitJevConfig_(validateJevConfig_(c))');
+  const state = harness.getUiState();
+  assert.equal(state.ok, true);
+  assert.deepEqual(state.settings.providers.map((p) => [p.id, p.apiUrl, p.model]), profiles.map((p) => [p.id, p.apiUrl, p.model]));
+  assert.ok(state.settings.providers.every((p) => p.apiKeyConfigured === true));
+  const serialized = JSON.stringify(state);
+  assert.ok(!serialized.includes('primary-private-key'));
+  assert.ok(!serialized.includes('backup-private-key'));
+});
+
+test('provider key save actions preserve keys by stable ID and return no configured key values', function () {
+  const harness = createHarness();
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'alpha',apiUrl:'https://a.example/v1',model:'a',apiKey:'secret-alpha'},{id:'beta',apiUrl:'https://b.example/v1',model:'b',apiKey:'secret-beta'}]; c.enabled = true; commitJevConfig_(validateJevConfig_(c))");
+  const state = harness.getUiState();
+  const settings = state.settings;
+  settings.providers = settings.providers.map(({ id, apiUrl, model }) => ({ id, apiUrl, model }));
+  settings.providers.reverse();
+  settings.providers[0].model = 'b-updated';
+  const saved = saveUiSettings(harness, { expectedRevision: state.revision, settings: settings, providerKeyActions: { alpha: 'keep', beta: 'replace' }, providerKeys: { beta: 'replacement-beta' } });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.settings.providers[0].id, 'beta');
+  assert.equal(saved.settings.providers[0].model, 'b-updated');
+  assert.ok(!JSON.stringify(saved).includes('replacement-beta'));
+  const committed = JSON.parse(harness.evaluate('JSON.stringify(getJevConfig_())'));
+  assert.equal(committed.providers.find((p) => p.id === 'alpha').apiKey, 'secret-alpha');
+  assert.equal(committed.providers.find((p) => p.id === 'beta').apiKey, 'replacement-beta');
+});
+
+test('provider IDs that match inherited object properties keep credentials without key actions', function () {
+  const harness = createHarness();
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'toString',apiUrl:'https://a.example/v1',model:'a',apiKey:'secret-string-provider'}]; c.enabled = false; commitJevConfig_(validateJevConfig_(c))");
+  const state = harness.getUiState();
+  const settings = state.settings;
+  settings.providers = settings.providers.map(({ id, apiUrl, model }) => ({ id, apiUrl, model }));
+  const saved = saveUiSettings(harness, { expectedRevision: state.revision, settings, providerKeyActions: {}, providerKeys: {} });
+  assert.equal(saved.ok, true);
+  const committed = JSON.parse(harness.evaluate('JSON.stringify(getJevConfig_())'));
+  assert.equal(committed.providers[0].apiKey, 'secret-string-provider');
+});
+
+test('provider removal drops its key while remaining IDs retain their keys; malformed key payloads are rejected', function () {
+  const harness = createHarness();
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'alpha',apiUrl:'https://a.example/v1',model:'a',apiKey:'secret-alpha'},{id:'beta',apiUrl:'https://b.example/v1',model:'b',apiKey:'secret-beta'}]; c.enabled = true; commitJevConfig_(validateJevConfig_(c))");
+  const state = harness.getUiState();
+  const settings = state.settings;
+  settings.providers = settings.providers.filter((p) => p.id === 'beta').map(({ id, apiUrl, model }) => ({ id, apiUrl, model }));
+  assert.equal(saveUiSettings(harness, { expectedRevision: state.revision, settings, providerKeyActions: { beta: 'keep' } }).ok, true);
+  let committed = JSON.parse(harness.evaluate('JSON.stringify(getJevConfig_())'));
+  assert.deepEqual(committed.providers.map((p) => p.id), ['beta']);
+  assert.equal(committed.providers[0].apiKey, 'secret-beta');
+  const nextState = harness.getUiState();
+  const nextSettings = nextState.settings;
+  nextSettings.providers = nextSettings.providers.map(({ id, apiUrl, model }) => ({ id, apiUrl, model }));
+  const malformed = saveUiSettings(harness, { expectedRevision: nextState.revision, settings: nextSettings, providerKeys: ['bad'] });
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.code, 'VALIDATION');
+});
+
+test('clearing one of several provider keys preserves the others and empty replacement is rejected', function () {
+  const harness = createHarness();
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'alpha',apiUrl:'https://a.example/v1',model:'a',apiKey:'secret-alpha'},{id:'beta',apiUrl:'https://b.example/v1',model:'b',apiKey:'secret-beta'}]; c.enabled = true; commitJevConfig_(validateJevConfig_(c))");
+  const state = harness.getUiState();
+  const settings = state.settings;
+  settings.providers = settings.providers.map(({ id, apiUrl, model }) => ({ id, apiUrl, model }));
+  const result = saveUiSettings(harness, { expectedRevision: state.revision, settings, providerKeyActions: { alpha: 'clear', beta: 'keep' } });
+  assert.equal(result.ok, true);
+  let committed = JSON.parse(harness.evaluate('JSON.stringify(getJevConfig_())'));
+  assert.equal(committed.providers.find((p) => p.id === 'alpha').apiKey, '');
+  assert.equal(committed.providers.find((p) => p.id === 'beta').apiKey, 'secret-beta');
+  const nextState = harness.getUiState();
+  const nextSettings = nextState.settings;
+  nextSettings.providers = nextSettings.providers.map(({ id, apiUrl, model }) => ({ id, apiUrl, model }));
+  const empty = saveUiSettings(harness, { expectedRevision: nextState.revision, settings: nextSettings, providerKeyActions: { alpha: 'replace', beta: 'keep' }, providerKeys: { alpha: '   ' } });
+  assert.equal(empty.ok, false);
+  assert.equal(empty.code, 'ERROR');
+});
+
+test('429 and 529 retry the active profile before rotating to a later keyed profile', function () {
+  const harness = createHarness({ fetchSequence: [{ status: 429 }, { status: 529 }, {}] });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'primary',apiUrl:'https://primary.example/v1',model:'m1',apiKey:'key-primary'},{id:'backup',apiUrl:'https://backup.example/v1',model:'m2',apiKey:'key-backup'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=c.providers[0].apiKey;c.advanced.providerAttempts=2; commitJevConfig_(validateJevConfig_(c))");
+  harness.run();
+  assert.equal(harness.counters.fetches, 3);
+  assert.deepEqual(harness.requests.map((r) => r.url), [
+    'https://primary.example/v1', 'https://primary.example/v1', 'https://backup.example/v1',
+  ]);
+  assert.deepEqual(harness.requests.map((r) => r.options.headers.Authorization), [
+    'Bearer key-primary', 'Bearer key-primary', 'Bearer key-backup',
+  ]);
+});
+
+test('provider rate limit takes precedence over a later generic failure and stops the run', function () {
+  const harness = createHarness({ candidateCount: 3, fetchSequence: [{ status: 429 }, { status: 400 }] });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'primary',apiUrl:'https://primary.example/v1',model:'m1',apiKey:'key-primary'},{id:'backup',apiUrl:'https://backup.example/v1',model:'m2',apiKey:'key-backup'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=c.providers[0].apiKey;c.advanced.providerAttempts=1;c.advanced.batchTargetTokens=1000; commitJevConfig_(validateJevConfig_(c))");
+  const summary = harness.run();
+  assert.equal(harness.counters.fetches, 2);
+  assert.equal(harness.counters.batchModifies, 0);
+  assert.equal(summary.ok, true);
+  assert.equal(summary.summary.stopped, true);
+  assert.equal(summary.summary.failed, 1);
+  assert.equal(summary.summary.deferred, 2, 'unsubmitted candidates should remain deferred after an exhausted profile rate limit');
+});
+
+test('successful backup becomes the starting profile for the next classification batch', function () {
+  const harness = createHarness({ candidateCount: 2, bodyLength: 5000, fetchSequence: [{ status: 400 }, {}, {}] });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'primary',apiUrl:'https://primary.example/v1',model:'m1',apiKey:'key-primary'},{id:'backup',apiUrl:'https://backup.example/v1',model:'m2',apiKey:'key-backup'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=c.providers[0].apiKey;c.advanced.batchTargetTokens=1000; commitJevConfig_(validateJevConfig_(c))");
+  harness.run();
+  assert.deepEqual(harness.requests.map((r) => r.url), [
+    'https://primary.example/v1', 'https://backup.example/v1', 'https://backup.example/v1',
+  ]);
+});
+
+test('unkeyed profiles are skipped and exhaustion visits each keyed profile once', function () {
+  const harness = createHarness({ fetchSequence: [{ status: 400 }, { status: 400 }] });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'empty',apiUrl:'https://empty.example/v1',model:'m0',apiKey:''},{id:'first',apiUrl:'https://first.example/v1',model:'m1',apiKey:'key-first'},{id:'second',apiUrl:'https://second.example/v1',model:'m2',apiKey:'key-second'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=''; commitJevConfig_(validateJevConfig_(c))");
+  harness.run();
+  assert.deepEqual(harness.requests.map((r) => r.url), ['https://first.example/v1', 'https://second.example/v1']);
+  assert.equal(harness.counters.batchModifies, 0, 'exhausted classification must not label any thread');
+});
+
+test('malformed provider response rotates to backup and diagnostics redact every configured key', function () {
+  const harness = createHarness({
+    fetchSequence: [{ body: '{not-json' }, {}],
+    fetchError: null,
+  });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'primary',apiUrl:'https://primary.example/v1',model:'m1',apiKey:'redact-primary'},{id:'backup',apiUrl:'https://backup.example/v1',model:'m2',apiKey:'redact-backup'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=c.providers[0].apiKey; commitJevConfig_(validateJevConfig_(c))");
+  harness.run();
+  assert.equal(harness.counters.fetches, 2);
+  assert.deepEqual(harness.requests.map((r) => r.url), ['https://primary.example/v1', 'https://backup.example/v1']);
+  const logs = harness.logs.map((entry) => entry.text).join('\n');
+  assert.ok(!logs.includes('redact-primary'));
+  assert.ok(!logs.includes('redact-backup'));
+});
+
+test('invalid category answers rotate to the next provider before any labels are applied', function () {
+  const harness = createHarness({ responseFactory: function (payload, fetchCount) {
+    const answers = {};
+    Object.keys(payload.questions).forEach(function (key) { answers[key] = { type: 'noul', noul: fetchCount === 1 ? 2 : 0 }; });
+    return { answers: answers };
+  } });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'primary',apiUrl:'https://primary.example/v1',model:'m1',apiKey:'key-primary'},{id:'backup',apiUrl:'https://backup.example/v1',model:'m2',apiKey:'key-backup'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=c.providers[0].apiKey; commitJevConfig_(validateJevConfig_(c))");
+  harness.run();
+  assert.deepEqual(harness.requests.map((r) => r.url), ['https://primary.example/v1', 'https://backup.example/v1']);
+  assert.equal(harness.counters.batchModifies, 1, 'labels are applied only after the backup response validates');
+});
+
+test('HTTP error diagnostics redact keys from every configured provider', function () {
+  const harness = createHarness({ fetchSequence: [
+    { status: 400, body: 'echo key-one key-two' },
+    { status: 400, body: 'echo key-one key-two' },
+  ] });
+  harness.evaluate("var c = getJevConfig_(); c.providers = [{id:'one',apiUrl:'https://one.example/v1',model:'m1',apiKey:'key-one'},{id:'two',apiUrl:'https://two.example/v1',model:'m2',apiKey:'key-two'}]; c.apiUrl=c.providers[0].apiUrl;c.model=c.providers[0].model;c.apiKey=c.providers[0].apiKey; commitJevConfig_(validateJevConfig_(c))");
+  harness.run();
+  const logs = harness.logs.map((entry) => entry.text).join('\n');
+  assert.ok(!logs.includes('key-one'));
+  assert.ok(!logs.includes('key-two'));
 });
 
 test('settings save persists a custom fallback and key replacement without returning secrets', function () {

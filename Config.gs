@@ -19,6 +19,7 @@ function createDefaultJevConfig_() {
   return {
     schemaVersion: 1, revision: 0, apiKey: '', enabled: false, scope: 'INBOX',
     intervalMinutes: 5, model: 'jev-latest', apiUrl: 'https://api.typesafe.ai/v1/systemone',
+    providers: [{ id: 'provider-1', apiUrl: 'https://api.typesafe.ai/v1/systemone', model: 'jev-latest', apiKey: '' }],
     schedule: { weekdays: [1, 2, 3, 4, 5, 6, 7], startTime: '00:00', endTime: '00:00', timeZone: 'America/New_York' },
     defaultThreshold: 0.75, fallbackLabel: 'Jev-Uncategoried',
     categories: JEV_CATEGORIES.map(function (item) {
@@ -76,6 +77,22 @@ function validateJevConfig_(input, options) {
   if (!isValidJevApiUrl_(config.apiUrl)) fail('apiUrl', 'Enter a complete HTTPS endpoint.');
   if (typeof config.apiKey !== 'string') fail('apiKey', 'API key is invalid.');
   if (typeof config.apiKey === 'string') config.apiKey = config.apiKey.trim();
+  if (!Array.isArray(config.providers)) {
+    config.providers = [{ id: 'provider-1', apiUrl: config.apiUrl, model: config.model, apiKey: config.apiKey }];
+  }
+  if (config.providers.length < 1 || config.providers.length > 5) fail('providers', 'Use one to five provider profiles.');
+  const providerIds = Object.create(null);
+  config.providers.forEach(function (provider, i) {
+    if (!provider || typeof provider !== 'object' || Array.isArray(provider)) { fail('providers.' + i, 'Provider profile is invalid.'); return; }
+    if (Object.keys(provider).some(function (key) { return ['id', 'apiUrl', 'model', 'apiKey'].indexOf(key) < 0; })) fail('providers.' + i, 'Provider profile includes unsupported fields.');
+    if (typeof provider.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(provider.id) || ['__proto__', 'constructor', 'prototype'].indexOf(provider.id) >= 0) fail('providers.' + i + '.id', 'Provider ID is invalid.');
+    if (providerIds[provider.id]) fail('providers.' + i + '.id', 'Provider IDs must be unique.'); providerIds[provider.id] = true;
+    if (!isValidJevApiUrl_(provider.apiUrl)) fail('providers.' + i + '.apiUrl', 'Enter a complete HTTPS endpoint.');
+    if (typeof provider.model !== 'string' || !provider.model.trim()) fail('providers.' + i + '.model', 'Model must not be empty.');
+    if (typeof provider.apiKey !== 'string') fail('providers.' + i + '.apiKey', 'API key is invalid.');
+    provider.apiUrl = String(provider.apiUrl || '').trim(); provider.model = String(provider.model || '').trim(); provider.apiKey = String(provider.apiKey || '').trim();
+  });
+  if (config.providers[0]) { config.apiUrl = config.providers[0].apiUrl; config.model = config.providers[0].model; config.apiKey = config.providers[0].apiKey; }
   if (opts.apiKeyAction === 'replace' && !config.apiKey) fail('apiKey', 'Enter a nonempty API key or choose Clear key.');
   if (typeof config.defaultThreshold !== 'number' || !Number.isFinite(config.defaultThreshold) || config.defaultThreshold < 0 || config.defaultThreshold > 1) fail('defaultThreshold', 'Threshold must be from 0 to 1.');
   const schedule = config.schedule || {};
@@ -117,7 +134,7 @@ function validateJevConfig_(input, options) {
   integer('advanced.initialRetryDelayMs', a.initialRetryDelayMs, 250, 5000);
   integer('advanced.gmailSpacingMs', a.gmailSpacingMs, 1000, 10000);
   if (!Array.isArray(a.cooldownMinutes) || a.cooldownMinutes.length !== 3 || a.cooldownMinutes.some(function (v, i) { return !Number.isInteger(v) || v < 15 || v > 1440 || (i && v < a.cooldownMinutes[i - 1]); })) fail('advanced.cooldownMinutes', 'Use three nondecreasing cooldowns from 15 to 1,440 minutes.');
-  if (config.enabled && (!config.apiKey || !categoriesAreObjects || !config.categories.some(function (c) { return c && c.enabled === true; }))) fail('enabled', 'Enable requires an API key and at least one enabled category.');
+  if (config.enabled && (!config.providers.some(function (p) { return p && p.apiKey; }) || !categoriesAreObjects || !config.categories.some(function (c) { return c && c.enabled === true; }))) fail('enabled', 'Enable requires an API key and at least one enabled category.');
   if (opts.apiKeyAction === 'clear' && config.enabled) fail('apiKeyAction', 'Pause processing before clearing the API key.');
   if (errors.length) { const error = new Error('Settings validation failed.'); error.validationErrors = errors; throw error; }
   config.schedule = { weekdays: config.schedule.weekdays.slice(), startTime: config.schedule.startTime, endTime: config.schedule.endTime, timeZone: config.schedule.timeZone };
@@ -147,7 +164,7 @@ function readJevConfigFromProperties_(snapshot) {
     if (utf8BytesJev_(json) !== head.byteLength || head.byteLength > JEV_CONFIG_MAX_BYTES_) throw new Error('Saved JEV settings are corrupt. Open Settings and restore from an export.');
     try {
       const parsed = JSON.parse(json);
-      const allowed = ['schemaVersion', 'revision', 'apiKey', 'enabled', 'scope', 'intervalMinutes', 'model', 'apiUrl', 'schedule', 'defaultThreshold', 'fallbackLabel', 'categories', 'advanced'];
+      const allowed = ['schemaVersion', 'revision', 'apiKey', 'enabled', 'scope', 'intervalMinutes', 'model', 'apiUrl', 'providers', 'schedule', 'defaultThreshold', 'fallbackLabel', 'categories', 'advanced'];
       if (!parsed || Object.keys(parsed).some(function (k) { return allowed.indexOf(k) < 0; })) throw new Error('fields');
       const config = validateJevConfig_(parsed);
       if (config.revision !== head.revision) throw new Error('revision');
@@ -162,6 +179,7 @@ function readJevConfigFromProperties_(snapshot) {
   config.scope = String(raw.JEV_SCOPE).trim().toUpperCase();
   config.intervalMinutes = Number(String(raw.JEV_INTERVAL_MINUTES).trim());
   config.model = String(raw.JEV_MODEL).trim(); config.apiUrl = String(raw.JEV_API_URL).trim();
+  config.providers = [{ id: 'provider-1', apiUrl: config.apiUrl, model: config.model, apiKey: config.apiKey }];
   return validateJevConfig_(config);
 }
 
