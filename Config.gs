@@ -59,7 +59,8 @@ function validateJevConfig_(input, options) {
     if (!Number.isInteger(value) || value < min || value > max) fail(path, 'Must be an integer from ' + min + ' to ' + max + '.');
   }
   function isReservedGmailLabel_(name) {
-    return ['INBOX', 'STARRED', 'IMPORTANT', 'UNREAD', 'SENT', 'DRAFT', 'SPAM', 'TRASH'].indexOf(String(name).toUpperCase()) >= 0 || /^CATEGORY_/.test(String(name).toUpperCase());
+    const label = String(name);
+    return label === 'Jev-Needs-Review' || ['INBOX', 'STARRED', 'IMPORTANT', 'UNREAD', 'SENT', 'DRAFT', 'SPAM', 'TRASH'].indexOf(label.toUpperCase()) >= 0 || /^CATEGORY_/.test(label.toUpperCase());
   }
   if (!config || typeof config !== 'object' || Array.isArray(config)) {
     fail('settings', 'Settings must be an object.');
@@ -102,7 +103,7 @@ function validateJevConfig_(input, options) {
   try { Utilities.formatDate(new Date(), schedule.timeZone, 'yyyy-MM-dd'); } catch (e) { fail('schedule.timeZone', 'Choose a valid time zone.'); }
   if (typeof config.fallbackLabel !== 'string' || !config.fallbackLabel.trim()) fail('fallbackLabel', 'Fallback label must not be empty.');
   if (typeof config.fallbackLabel === 'string') config.fallbackLabel = config.fallbackLabel.trim();
-  if (typeof config.fallbackLabel === 'string' && isReservedGmailLabel_(config.fallbackLabel)) fail('fallbackLabel', 'Choose a label name that is not reserved by Gmail.');
+  if (typeof config.fallbackLabel === 'string' && isReservedGmailLabel_(config.fallbackLabel)) fail('fallbackLabel', 'Choose a label name that is not reserved by Gmail or JEV processing.');
   if (config.fallbackLabel === 'JEV') fail('fallbackLabel', 'Fallback label must differ from JEV.');
   const categoriesAreList = Array.isArray(config.categories);
   if (!categoriesAreList) fail('categories', 'Categories must be a list.');
@@ -114,8 +115,8 @@ function validateJevConfig_(input, options) {
     if (keys[cat.key]) fail('categories.' + i + '.key', 'Category keys must be unique.'); keys[cat.key] = true;
     if (typeof cat.label !== 'string' || !cat.label.trim()) fail('categories.' + i + '.label', 'Label must not be empty.');
     if (typeof cat.label === 'string') cat.label = cat.label.trim();
-    if (typeof cat.label === 'string' && isReservedGmailLabel_(cat.label)) fail('categories.' + i + '.label', 'Choose a label name that is not reserved by Gmail.');
-    if (cat.label === 'JEV' || cat.label === config.fallbackLabel || labels[cat.label]) fail('categories.' + i + '.label', 'Labels must be unique and differ from JEV and fallback.'); labels[cat.label] = true;
+    if (typeof cat.label === 'string' && isReservedGmailLabel_(cat.label)) fail('categories.' + i + '.label', 'Choose a label name that is not reserved by Gmail or JEV processing.');
+    if (cat.label === 'JEV' || cat.label === 'Jev-Needs-Review' || cat.label === config.fallbackLabel || labels[cat.label]) fail('categories.' + i + '.label', 'Labels must be unique and differ from JEV, review, and fallback.'); labels[cat.label] = true;
     if (typeof cat.description !== 'string' || !cat.description.trim()) fail('categories.' + i + '.description', 'Description must not be empty.');
     if (typeof cat.description === 'string') cat.description = cat.description.trim();
     if (typeof cat.enabled !== 'boolean') fail('categories.' + i + '.enabled', 'Choose whether the category is enabled.');
@@ -148,6 +149,40 @@ function validateJevConfig_(input, options) {
   return config;
 }
 
+// Recover the one label reserved by the review hold when reading configurations
+// written before that label was reserved. Keep this as an in-memory migration:
+// the committed revision/head remains authoritative until the user saves again.
+function migrateReservedReviewLabels_(config) {
+  if (!config || typeof config !== 'object') return config;
+  const used = Object.create(null);
+  if (Array.isArray(config.categories)) config.categories.forEach(function (category) {
+    if (category && typeof category.label === 'string') {
+      category.label = category.label.trim();
+      if (category.label !== 'Jev-Needs-Review') used[category.label] = true;
+    }
+  });
+  if (typeof config.fallbackLabel === 'string') config.fallbackLabel = config.fallbackLabel.trim();
+  if (config.fallbackLabel === 'Jev-Needs-Review') {
+    const baseFallback = 'Jev-Uncategoried';
+    config.fallbackLabel = baseFallback;
+    let suffix = 2;
+    while (used[config.fallbackLabel]) config.fallbackLabel = baseFallback + '-' + suffix++;
+    used[config.fallbackLabel] = true;
+  }
+  if (!Array.isArray(config.categories)) return config;
+  config.categories.forEach(function (category) {
+    if (!category || category.label !== 'Jev-Needs-Review') return;
+    const definition = JEV_CATEGORIES.filter(function (item) { return item.key === category.key; })[0];
+    let label = definition ? definition.label : 'Jev-Category-' + category.key;
+    const base = label;
+    let suffix = 2;
+    while (used[label] || label === config.fallbackLabel || label === 'Jev-Needs-Review') label = base + '-' + suffix++;
+    category.label = label;
+    used[label] = true;
+  });
+  return config;
+}
+
 function readJevConfigFromProperties_(snapshot) {
   const props = snapshot || PropertiesService.getScriptProperties().getProperties();
   const headText = props[JEV_CONFIG_HEAD_PROPERTY_];
@@ -166,8 +201,8 @@ function readJevConfigFromProperties_(snapshot) {
       const parsed = JSON.parse(json);
       const allowed = ['schemaVersion', 'revision', 'apiKey', 'enabled', 'scope', 'intervalMinutes', 'model', 'apiUrl', 'providers', 'schedule', 'defaultThreshold', 'fallbackLabel', 'categories', 'advanced'];
       if (!parsed || Object.keys(parsed).some(function (k) { return allowed.indexOf(k) < 0; })) throw new Error('fields');
-      const config = validateJevConfig_(parsed);
-      if (config.revision !== head.revision) throw new Error('revision');
+      if (parsed.revision !== head.revision) throw new Error('revision');
+      const config = validateJevConfig_(migrateReservedReviewLabels_(parsed));
       return config;
     } catch (e) { throw new Error('Saved JEV settings are corrupt. Open Settings and restore from an export.'); }
   }

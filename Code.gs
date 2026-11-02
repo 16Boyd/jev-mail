@@ -1,5 +1,6 @@
 const JEV_CLASSIFY_TOKEN_CHARS_PER_TOKEN_ = 4;
 const JEV_PROCESSED_LABEL_ = 'JEV';
+const JEV_NEEDS_REVIEW_LABEL_ = 'Jev-Needs-Review';
 const JEV_TRIGGER_HANDLER_ = 'runJevBatch';
 const JEV_TRIGGER_INTERVAL_PROPERTY_ = 'JEV_INTERNAL_TRIGGER_INTERVAL_MINUTES';
 const JEV_TRIGGER_ID_PROPERTY_ = 'JEV_INTERNAL_TRIGGER_ID';
@@ -73,11 +74,11 @@ function executeJevRun_(source) {
     if (!config.providers.some(function (p) { return p.apiKey; }) || !getEnabledJevCategories_(config).length) return { ok: true, skipped: true, reason: 'configuration_incomplete' };
     if (isJevCooldownActive_()) return { ok: true, skipped: true, reason: 'cooldown' };
     try { PropertiesService.getScriptProperties().setProperty(JEV_RUNNING_PROPERTY_, JSON.stringify({ startedAt: startedAt, source: source, revision: config.revision })); } catch (ignored) {}
-    const summary = runJevBatchLocked_(config, metrics, runContext) || { succeeded: 0, failed: 0, deferred: 0 };
+    const summary = runJevBatchLocked_(config, metrics, runContext) || { succeeded: 0, needsReview: 0, failed: 0, deferred: 0 };
     const endedAt = Date.now();
     appendJevRunHistory_({ startedAt: startedAt, endedAt: endedAt, source: source, revision: config.revision,
       outcome: summary.failed ? 'partial' : (summary.deferred || summary.reason === 'deadline') ? 'deferred' : 'complete',
-      succeeded: summary.succeeded || 0, failed: summary.failed || 0, deferred: summary.deferred || 0,
+      succeeded: summary.succeeded || 0, needsReview: summary.needsReview || 0, failed: summary.failed || 0, deferred: summary.deferred || 0,
       durationMs: endedAt - startedAt, metrics: { classifierFetchAttempts: metrics.classifierFetchAttempts } });
     return { ok: true, summary: summary };
   } catch (error) {
@@ -126,54 +127,54 @@ function logJevRunMetrics_(metrics, durationMs) {
 function runJevBatchLocked_(config, metrics, runContext) {
   if (runContext.source === 'scheduled' && !config.enabled) {
     console.log('[JEV] Disabled; no Gmail search or API request made.');
-    return { succeeded: 0, failed: 0, deferred: 0 };
+    return { succeeded: 0, needsReview: 0, failed: 0, deferred: 0 };
   }
   if (!config.providers.some(function (p) { return p.apiKey; })) {
     console.error('[JEV] Enabled but JEV_API_KEY is empty; batch skipped.');
-    return { succeeded: 0, failed: 0, deferred: 0 };
+    return { succeeded: 0, needsReview: 0, failed: 0, deferred: 0 };
   }
 
   if (isJevCooldownActive_()) {
     console.log('[JEV] Gmail quota cooldown is active; batch skipped.');
-    return { succeeded: 0, failed: 0, deferred: 0 };
+    return { succeeded: 0, needsReview: 0, failed: 0, deferred: 0 };
   }
 
   let threadRefs;
   try {
     threadRefs = findUncategorizedThreads_(config, metrics, runContext);
   } catch (error) {
-    if (isJevDeadlineError_(error)) return { succeeded: 0, failed: 0, deferred: 0, stopped: true, reason: 'deadline' };
+    if (isJevDeadlineError_(error)) return { succeeded: 0, needsReview: 0, failed: 0, deferred: 0, stopped: true, reason: 'deadline' };
     recordJevRateLimitIfNeeded_(error, true, config);
     console.error('[JEV] Gmail search failed; batch skipped: ' + getSafeErrorMessage_(error, config.apiKey));
-    return { succeeded: 0, failed: 1, deferred: 0 };
+    return { succeeded: 0, needsReview: 0, failed: 1, deferred: 0 };
   }
 
   const batch = threadRefs.slice(0, config.advanced.maxThreadsToClassify);
   console.log('[JEV] Found ' + threadRefs.length + ' candidate thread(s); classifying ' + batch.length + '.');
   if (!batch.length) {
     clearJevCooldown_();
-    return { succeeded: 0, failed: 0, deferred: 0 };
+    return { succeeded: 0, needsReview: 0, failed: 0, deferred: 0 };
   }
 
   let labelIdsByName;
   try {
     labelIdsByName = getLabelIdsByName_(metrics);
   } catch (error) {
-    if (isJevDeadlineError_(error)) return { succeeded: 0, failed: 0, deferred: batch.length, stopped: true, reason: 'deadline' };
+    if (isJevDeadlineError_(error)) return { succeeded: 0, needsReview: 0, failed: 0, deferred: batch.length, stopped: true, reason: 'deadline' };
     recordJevRateLimitIfNeeded_(error, true, config);
     console.error('[JEV] Could not read or create Gmail labels; batch skipped: ' + getSafeErrorMessage_(error, config.apiKey));
-    return { succeeded: 0, failed: 1, deferred: 0, reason: 'label_setup' };
+    return { succeeded: 0, needsReview: 0, failed: 1, deferred: 0, reason: 'label_setup' };
   }
 
-  const summary = { succeeded: 0, failed: 0, deferred: 0, stopped: false };
+  const summary = { succeeded: 0, needsReview: 0, failed: 0, deferred: 0, stopped: false };
   let pendingItems = [];
   for (let i = 0; i < batch.length; i += 1) {
-    if (Date.now() >= runContext.deadlineAt) { summary.stopped = true; summary.deferred += batch.length - i; break; }
     if (summary.stopped) break;
+    if (Date.now() >= runContext.deadlineAt) { summary.stopped = true; summary.deferred += batch.length - i; break; }
     const threadRef = batch[i];
     let threadData;
     try {
-      threadData = threadToJevState_(threadRef.id, metrics, config);
+      threadData = threadToJevState_(threadRef.id, metrics, config, labelIdsByName);
     } catch (error) {
       if (isJevDeadlineError_(error)) { summary.stopped = true; summary.deferred += batch.length - i; break; }
       error = addJevDiagnosticContextSafely_(error, { processingPhase: 'thread_read' });
@@ -182,15 +183,25 @@ function runJevBatchLocked_(config, metrics, runContext) {
       if (isJevRateLimitError_(error)) {
         recordJevRateLimitIfNeeded_(error, true, config);
         summary.stopped = true;
-        summary.deferred = Math.max(0, batch.length - summary.succeeded - summary.failed);
+        summary.deferred = Math.max(0, batch.length - summary.succeeded - (summary.needsReview || 0) - summary.failed);
         console.error('[JEV] Stopping this batch after a rate-limit error; remaining thread(s) will be retried on a later trigger.');
         break;
       }
       continue;
     }
 
+    if (threadData.localSummaryFailure || threadData.reviewHold) {
+      routeJevThreadToReview_(threadRef.id, threadData, config, labelIdsByName, metrics, summary, batch.length, runContext);
+      continue;
+    }
+
     const item = { threadId: threadRef.id, threadData: threadData, candidateIndex: i };
     truncateJevThreadToFit_(item, config.model, config);
+    // Reject an impossible singleton before flushing healthy pending threads.
+    if (getJevBatchTokenViolation_(getJevBatchAssessment_([item], config.model, config), config)) {
+      routeJevThreadToReview_(threadRef.id, threadData, config, labelIdsByName, metrics, summary, batch.length, runContext);
+      continue;
+    }
     let proposedItems = pendingItems.concat([item]);
     let assessment = getJevBatchAssessment_(proposedItems, config.model, config);
     let violation = getJevBatchTokenViolation_(assessment, config);
@@ -203,18 +214,6 @@ function runJevBatchLocked_(config, metrics, runContext) {
 
       proposedItems = [item];
       assessment = getJevBatchAssessment_(proposedItems, config.model, config);
-      violation = getJevBatchTokenViolation_(assessment, config);
-      if (violation) {
-        const sizeError = new Error('JEV request exceeds supported token limits.');
-        addJevDiagnosticContextSafely_(sizeError, {
-          processingPhase: 'classification',
-          estimatedTokens: violation.estimatedTokens,
-          tokenLimit: violation.tokenLimit,
-        });
-        summary.failed += 1;
-        logThreadProcessingError_(threadRef.id, sizeError, config);
-        continue;
-      }
     }
 
     pendingItems = proposedItems;
@@ -227,9 +226,9 @@ function runJevBatchLocked_(config, metrics, runContext) {
   if (!summary.stopped && pendingItems.length) {
     flushJevThreadBatch_(pendingItems, config, labelIdsByName, metrics, summary, batch.length, runContext);
   }
-  if (summary.stopped) summary.deferred = Math.max(summary.deferred, batch.length - summary.succeeded - summary.failed);
+  if (summary.stopped) summary.deferred = Math.max(summary.deferred, batch.length - summary.succeeded - (summary.needsReview || 0) - summary.failed);
   if (!summary.failed && !summary.deferred) clearJevCooldown_();
-  console.log('[JEV] Batch complete: ' + summary.succeeded + ' succeeded, ' + summary.failed + ' failed, ' + summary.deferred + ' deferred.');
+  console.log('[JEV] Batch complete: ' + summary.succeeded + ' succeeded, ' + summary.failed + ' failed, ' + summary.needsReview + ' needs review, ' + summary.deferred + ' deferred.');
   return summary;
 }
 
@@ -499,7 +498,7 @@ function reconcileJevTrigger_(intervalMinutes, forceRepair) {
 /** Returns at most maxThreads unprocessed Gmail threads for the chosen scope. */
 function findUncategorizedThreads_(config, metrics, runContext) {
   const scopeQuery = config.scope === 'INBOX' ? 'in:inbox' : 'in:anywhere';
-  const query = scopeQuery + ' -in:spam -in:trash -in:sent -in:drafts -label:' + JEV_PROCESSED_LABEL_;
+  const query = scopeQuery + ' -in:spam -in:trash -in:sent -in:drafts -label:' + JEV_PROCESSED_LABEL_ + ' -label:' + JEV_NEEDS_REVIEW_LABEL_;
   beforeJevGmailRequest_(runContext);
   metrics.gmailAttempts['threads.list'] += 1;
   const result = Gmail.Users.Threads.list('me', {
@@ -512,7 +511,7 @@ function findUncategorizedThreads_(config, metrics, runContext) {
 }
 
 /** Serializes incoming messages in the thread, excluding Spam, Trash, Sent, and Drafts. */
-function threadToJevState_(threadId, metrics, config) {
+function threadToJevState_(threadId, metrics, config, labelIdsByName) {
   beforeJevGmailRequest_();
   metrics.gmailAttempts['threads.get'] += 1;
   const thread = Gmail.Users.Threads.get('me', threadId, { format: 'full' });
@@ -529,17 +528,36 @@ function threadToJevState_(threadId, metrics, config) {
     throw new Error('Thread contains no eligible messages.');
   }
 
-  const decodedBudget = { length: 0 };
-  const messages = eligibleMessages.map(function (message, index) {
-    const body = getPlainTextBody_(message.payload || {}, index + 1, decodedBudget);
-    if (body.length > 100000) throw new Error('Local summary input exceeds safe limits.');
-    return { summary: summarizeJevMessage_(body, config) };
-  });
-
-  return {
-    state: { messages: messages },
-    messageIds: eligibleMessages.map(function (message) { return message.id; }),
-  };
+  // Capture every eligible ID before any local operation can reject a message.
+  const messageIds = eligibleMessages.map(function (message) { return message.id; });
+  const reviewLabelId = labelIdsByName && labelIdsByName[JEV_NEEDS_REVIEW_LABEL_];
+  if (reviewLabelId && eligibleMessages.some(function (message) {
+    return (message.labelIds || []).indexOf(reviewLabelId) >= 0;
+  })) {
+    return { reviewHold: true, messageIds: messageIds };
+  }
+  try {
+    const decodedBudget = { length: 0 };
+    const messages = eligibleMessages.map(function (message, index) {
+      const body = getPlainTextBody_(message.payload || {}, index + 1, decodedBudget);
+      if (body.length > 100000) throw new Error('Local summary input exceeds safe limits.');
+      return { summary: summarizeJevMessage_(body, config) };
+    });
+    const state = validateJevSummaryState_({ messages: messages }, config);
+    return { state: state, messageIds: messageIds };
+  } catch (error) {
+    const context = getJevPropertySafely_(error, 'jevDiagnosticContext');
+    const message = getJevPropertySafely_(error, 'message');
+    if (!getJevPropertySafely_(context, 'bodyDecode') && [
+      'Local summary input exceeds safe limits.', 'Local summary could not be safely produced.',
+      'Local summary validation failed.',
+    ].indexOf(message) < 0) throw error;
+    const safeError = new Error('Local summary could not be safely produced.');
+    if (getJevPropertySafely_(context, 'bodyDecode')) {
+      addJevDiagnosticContextSafely_(safeError, { bodyDecode: context.bodyDecode });
+    }
+    return { localSummaryFailure: true, messageIds: messageIds, error: safeError };
+  }
 }
 
 /** Normalize before detection, including entity-encoded credential delimiters. */
@@ -1164,7 +1182,7 @@ function getOrCreateLabelId_(name, labelIdsByName, metrics) {
       messageListVisibility: 'show',
     }, 'me');
   } catch (createError) {
-    if (isJevRateLimitError_(createError)) throw createError;
+    if (isJevDeadlineError_(createError) || isJevRateLimitError_(createError)) throw createError;
     try {
       const refreshedLabelIdsByName = getLabelIdsByName_(metrics);
       if (refreshedLabelIdsByName[name]) {
@@ -1172,7 +1190,7 @@ function getOrCreateLabelId_(name, labelIdsByName, metrics) {
         return refreshedLabelIdsByName[name];
       }
     } catch (refreshError) {
-      if (isJevRateLimitError_(refreshError)) throw refreshError;
+      if (isJevDeadlineError_(refreshError) || isJevRateLimitError_(refreshError)) throw refreshError;
       // Keep the original create failure as the actionable error.
     }
     throw createError;
@@ -1180,6 +1198,53 @@ function getOrCreateLabelId_(name, labelIdsByName, metrics) {
   if (!created || !created.id) throw new Error('Gmail did not return a label ID.');
   labelIdsByName[name] = created.id;
   return created.id;
+}
+
+/** Hands an unsafe local summary to a human without classification labels. */
+function applyJevNeedsReviewLabel_(threadData, labelIdsByName, metrics) {
+  let phase = 'label_resolution';
+  try {
+    const ids = threadData.messageIds;
+    if (!Array.isArray(ids) || !ids.length || ids.some(function (id) { return typeof id !== 'string' || !id.trim(); })) {
+      throw new Error('Thread contains no eligible messages.');
+    }
+    if (ids.length > 1000) throw new Error('Thread exceeds the Gmail batch label limit.');
+    const labelId = getOrCreateLabelId_(JEV_NEEDS_REVIEW_LABEL_, labelIdsByName, metrics);
+    phase = 'gmail_labeling';
+    beforeJevGmailRequest_();
+    metrics.gmailAttempts['messages.batchModify'] += 1;
+    Gmail.Users.Messages.batchModify({ addLabelIds: [labelId], ids: ids }, 'me');
+  } catch (error) {
+    throw addJevDiagnosticContextSafely_(error, { processingPhase: phase });
+  }
+}
+
+function routeJevThreadToReview_(threadId, threadData, config, labelIdsByName, metrics, summary, totalCandidates, runContext) {
+  try {
+    assertJevRunTime_(runContext);
+    applyJevNeedsReviewLabel_(threadData, labelIdsByName, metrics);
+    summary.needsReview += 1;
+    console.log(threadData.reviewHold ? '[JEV] Thread remains held for manual review.' : threadData.localSummaryFailure
+      ? '[JEV] Thread handed to manual review: local summary unavailable.'
+      : '[JEV] Thread handed to manual review: singleton token limit exceeded.');
+  } catch (error) {
+    if (isJevDeadlineError_(error)) {
+      summary.stopped = true;
+    } else {
+      summary.failed += 1;
+      const context = getJevPropertySafely_(error, 'jevDiagnosticContext');
+      const phase = getJevPropertySafely_(context, 'processingPhase');
+      console.error('[JEV] Manual review labeling failed: ' + JSON.stringify({
+        phase: ['label_resolution', 'gmail_labeling'].indexOf(phase) >= 0 ? phase : 'unknown',
+        errorName: isJevRateLimitError_(error) ? 'RateLimitError' : 'LabelingError',
+      }));
+      if (isJevRateLimitError_(error)) {
+        recordJevRateLimitIfNeeded_(error, true, config);
+        summary.stopped = true;
+      }
+    }
+    if (summary.stopped) summary.deferred = Math.max(0, totalCandidates - summary.succeeded - summary.needsReview - summary.failed);
+  }
 }
 
 /** Applies one validated thread result to only that thread's eligible messages. */
@@ -1244,7 +1309,7 @@ function flushJevThreadBatch_(items, config, labelIdsByName, metrics, summary, t
     });
     if (isJevRateLimitError_(error)) {
       summary.stopped = true;
-      summary.deferred = Math.max(0, totalCandidates - summary.succeeded - summary.failed);
+      summary.deferred = Math.max(0, totalCandidates - summary.succeeded - (summary.needsReview || 0) - summary.failed);
       console.error('[JEV] Stopping this batch after a rate-limit error; remaining thread(s) will be retried on a later trigger.');
     }
     return;
@@ -1272,7 +1337,7 @@ function flushJevThreadBatch_(items, config, labelIdsByName, metrics, summary, t
           recordJevRateLimitIfNeeded_(error, true, config);
         }
         summary.stopped = true;
-        summary.deferred = Math.max(0, totalCandidates - summary.succeeded - summary.failed);
+        summary.deferred = Math.max(0, totalCandidates - summary.succeeded - (summary.needsReview || 0) - summary.failed);
         console.error('[JEV] Stopping this batch after a rate-limit error; remaining thread(s) will be retried on a later trigger.');
       }
     }

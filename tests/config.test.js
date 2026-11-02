@@ -66,6 +66,16 @@ function defaultConfig(harness) {
   return JSON.parse(harness.evaluate('JSON.stringify(createDefaultJevConfig_())'));
 }
 
+function withCommittedConfig(config) {
+  const json = JSON.stringify(config);
+  const generation = 'legacygeneration';
+  const chunks = [];
+  for (let offset = 0; offset < json.length; offset += 7000) chunks.push(json.slice(offset, offset + 7000));
+  const properties = { JEV_CONFIG_HEAD: JSON.stringify({ schemaVersion: 1, generation, revision: config.revision, chunks: chunks.length, byteLength: Buffer.byteLength(json, 'utf8') }) };
+  chunks.forEach((chunk, index) => { properties['JEV_CONFIG_' + generation + '_' + index] = chunk; });
+  return properties;
+}
+
 test('legacy properties migrate without losing existing provider and schedule values', function () {
   const harness = makeConfigHarness({
     JEV_API_KEY: 'legacy-key',
@@ -191,6 +201,40 @@ test('corrupt committed heads and missing chunks fail closed', function () {
   assert.throws(() => missingChunk.evaluate('getJevConfig_()'), /corrupt/);
 });
 
+test('saved review-label settings recover in memory without changing revision or unrelated values', function () {
+  const fallbackConfig = defaultConfig(makeConfigHarness());
+  fallbackConfig.revision = 12;
+  fallbackConfig.apiKey = 'preserved-key';
+  fallbackConfig.providers[0].apiKey = 'preserved-key';
+  fallbackConfig.model = 'preserved-model';
+  fallbackConfig.providers[0].model = 'preserved-model';
+  fallbackConfig.categories[0].description = 'preserved category description';
+  fallbackConfig.categories[0].label = 'Jev-Uncategoried';
+  fallbackConfig.fallbackLabel = ' Jev-Needs-Review ';
+  const fallbackProps = withCommittedConfig(fallbackConfig);
+  const fallbackHarness = makeConfigHarness(fallbackProps);
+  const recoveredFallback = JSON.parse(fallbackHarness.evaluate('JSON.stringify(getJevConfig_())'));
+  assert.equal(recoveredFallback.fallbackLabel, 'Jev-Uncategoried-2');
+  assert.equal(recoveredFallback.categories[0].label, 'Jev-Uncategoried');
+  assert.equal(recoveredFallback.revision, 12);
+  assert.equal(recoveredFallback.apiKey, 'preserved-key');
+  assert.equal(recoveredFallback.model, 'preserved-model');
+  assert.equal(recoveredFallback.categories[0].description, 'preserved category description');
+  assert.equal(fallbackHarness.properties.JEV_CONFIG_HEAD, fallbackProps.JEV_CONFIG_HEAD, 'read recovery does not commit or bump the saved revision');
+
+  const categoryConfig = defaultConfig(makeConfigHarness());
+  categoryConfig.revision = 7;
+  categoryConfig.categories[0].label = 'Jev-Needs-Review';
+  const categoryProps = withCommittedConfig(categoryConfig);
+  const categoryHarness = makeConfigHarness(categoryProps);
+  const recoveredCategory = JSON.parse(categoryHarness.evaluate('JSON.stringify(getJevConfig_())'));
+  assert.equal(recoveredCategory.categories[0].label, 'Jev-Pending');
+  assert.equal(recoveredCategory.revision, 7);
+  assert.equal(categoryHarness.properties.JEV_CONFIG_HEAD, categoryProps.JEV_CONFIG_HEAD);
+  assert.notEqual(recoveredCategory.fallbackLabel, 'Jev-Needs-Review');
+  assert.ok(recoveredCategory.categories.every((category) => category.label !== 'Jev-Needs-Review'));
+});
+
 test('configuration revisions must be nonnegative integers and agree with the head', function () {
   const harness = makeConfigHarness();
   const invalid = defaultConfig(harness);
@@ -221,6 +265,11 @@ test('category threshold validation and fallback label uniqueness are enforced',
   assert.throws(() => harness.evaluate('validateJevConfig_(' + JSON.stringify(config) + ')'), /validation failed/);
   config.categories[0].label = 'Jev-Pending';
   config.fallbackLabel = 'SPAM';
+  assert.throws(() => harness.evaluate('validateJevConfig_(' + JSON.stringify(config) + ')'), /validation failed/);
+  config.fallbackLabel = 'Jev-Needs-Review';
+  assert.throws(() => harness.evaluate('validateJevConfig_(' + JSON.stringify(config) + ')'), /validation failed/);
+  config.fallbackLabel = 'Jev-Uncategoried';
+  config.categories[0].label = 'Jev-Needs-Review';
   assert.throws(() => harness.evaluate('validateJevConfig_(' + JSON.stringify(config) + ')'), /validation failed/);
 });
 

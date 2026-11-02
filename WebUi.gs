@@ -44,7 +44,13 @@ function getJevUiState() {
 }
 
 function readJevHistory_(properties) {
-  try { const value = properties[JEV_RUN_HISTORY_PROPERTY_]; const parsed = value ? JSON.parse(value) : []; return Array.isArray(parsed) ? parsed.slice(-20) : []; } catch (ignored) { return []; }
+  try {
+    const value = properties[JEV_RUN_HISTORY_PROPERTY_]; const parsed = value ? JSON.parse(value) : [];
+    return Array.isArray(parsed) ? parsed.slice(-20).map(function (run) {
+      if (!run || typeof run !== 'object' || Array.isArray(run)) return run;
+      return Object.assign({}, run, { needsReview: Number.isInteger(run.needsReview) && run.needsReview >= 0 ? run.needsReview : 0 });
+    }) : [];
+  } catch (ignored) { return []; }
 }
 function getJevTriggerHealth_(config) {
   try {
@@ -154,6 +160,8 @@ function appendJevRunHistory_(summary) {
   try {
     const props = PropertiesService.getScriptProperties();
     const history = readJevHistory_(props.getProperties());
-    history.push(summary); props.setProperty(JEV_RUN_HISTORY_PROPERTY_, JSON.stringify(history.slice(-20)));
+    const run = Object.assign({}, summary || {});
+    if (!Number.isInteger(run.needsReview) || run.needsReview < 0) run.needsReview = 0;
+    history.push(run); props.setProperty(JEV_RUN_HISTORY_PROPERTY_, JSON.stringify(history.slice(-20)));
   } catch (ignored) {}
 }

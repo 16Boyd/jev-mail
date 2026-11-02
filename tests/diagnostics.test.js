@@ -31,7 +31,7 @@ function makeThread(encodedBody, mimeType, bodySize, threadId, messageSpecs) {
     return { messages: [{ id: 'sent-message-' + threadId, labelIds: ['SENT'], payload: { mimeType: 'text/plain', body: { data: base64Url('ignored sent-message content') } } }].concat(messageSpecs.map(function (spec, index) {
       return {
         id: spec.id || 'eligible-message-' + threadId + '-' + index,
-        labelIds: ['INBOX'],
+        labelIds: spec.labelIds || ['INBOX'],
         payload: {
           mimeType: 'multipart/alternative',
           headers: [{ name: 'From', value: spec.sender || FIXTURE_SENDER }, { name: 'Subject', value: spec.subject || FIXTURE_SUBJECT }],
@@ -94,6 +94,7 @@ function createHarness(options) {
     batchModifyIds: [],
     batchModifyCalls: [],
     threadReadIds: [],
+    labelQueries: [],
     triggerCreates: 0,
     triggerDeletes: 0,
     sleeps: [],
@@ -191,6 +192,7 @@ function createHarness(options) {
         Threads: {
           list: function () {
             counters.searches += 1;
+            counters.labelQueries.push(arguments[1] && arguments[1].q);
             return { threads: settings.candidateCount
               ? Array.from({ length: settings.candidateCount }, function (_, index) { return { id: (settings.threadId || FIXTURE_THREAD_ID) + '-' + index }; })
               : [{ id: settings.threadId || FIXTURE_THREAD_ID }] };
@@ -203,6 +205,7 @@ function createHarness(options) {
               error.name = 'GoogleJsonResponseException';
               throw error;
             }
+            if (threadId === settings.threadReadErrorThreadId) throw new Error('injected Gmail thread read failure');
             const bodyByThread = settings.threadBodies || {};
             const body = bodyByThread[threadId] !== undefined
               ? bodyByThread[threadId]
@@ -228,6 +231,7 @@ function createHarness(options) {
               { id: 'system-spam', name: 'SPAM', type: 'system' },
               { id: 'system-trash', name: 'TRASH', type: 'system' },
             ];
+            if (settings.existingReviewLabel) labels.push({ id: 'label-needs-review', name: 'Jev-Needs-Review', type: 'user' });
             if (settings.missingProcessedLabel) labels.splice(0, 1);
             if (settings.raceLabelVisible && counters.labelLists > 1) {
               labels.push({ id: 'race-label-id', name: settings.raceLabelName || 'Jev-Pending', type: 'user' });
@@ -236,6 +240,7 @@ function createHarness(options) {
           },
     create: function (request) {
       counters.labelCreates += 1;
+      if (settings.labelCreateError && request.name === 'Jev-Needs-Review') throw settings.labelCreateError;
       if (['INBOX', 'SPAM', 'TRASH'].indexOf(request.name) >= 0) throw new Error('System labels cannot be created.');
       if (settings.createConflict && request.name === settings.conflictLabelName) throw new Error('Label name already exists');
             return { id: 'created-label-' + request.name };
@@ -245,7 +250,8 @@ function createHarness(options) {
           batchModify: function (request) {
             counters.batchModifies += 1;
             counters.batchModifyIds.push(request.addLabelIds);
-            counters.batchModifyCalls.push({ ids: request.ids.slice(), addLabelIds: request.addLabelIds.slice() });
+            counters.batchModifyCalls.push({ ids: Array.from(request.ids), addLabelIds: Array.from(request.addLabelIds) });
+            if (settings.reviewModifyError && (request.addLabelIds.indexOf('label-needs-review') >= 0 || request.addLabelIds.indexOf('created-label-Jev-Needs-Review') >= 0)) throw settings.reviewModifyError;
             if (settings.batchModifyQuotaError) {
               const error = new Error("Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' of service 'gmail.googleapis.com'.");
               error.name = 'GoogleJsonResponseException';
@@ -438,7 +444,7 @@ test('throwing exception property getters do not interrupt logging or the batch'
   });
   assert.equal(harness.counters.threadReads, 2, 'batch processing should continue after the first failure');
   assert.equal(harness.counters.fetches, 1);
-  assert.match(logText, /Batch complete: 0 succeeded, 2 failed, 0 deferred\./);
+  assert.match(logText, /Batch complete: 0 succeeded, 2 failed, 0 needs review, 0 deferred\./);
 });
 
 test('throwing diagnostic-context getters preserve Gmail quota stop and defer behavior', function () {
@@ -456,7 +462,7 @@ test('throwing diagnostic-context getters preserve Gmail quota stop and defer be
   assert.equal(harness.counters.threadReads, 3);
   assert.equal(harness.counters.fetches, 1);
   assert.equal(harness.counters.batchModifies, 1);
-  assert.match(logText, /Batch complete: 0 succeeded, 1 failed, 2 deferred\./);
+  assert.match(logText, /Batch complete: 0 succeeded, 1 failed, 0 needs review, 2 deferred\./);
 });
 
 test('hostile nested diagnostic getters are omitted without interrupting later threads', function () {
@@ -495,7 +501,7 @@ test('hostile nested diagnostic getters are omitted without interrupting later t
   assert.equal(harness.counters.threadReads, 2);
   assert.equal(harness.counters.fetches, 1);
   assert.equal(harness.counters.batchModifies, 2);
-  assert.match(logText, /Batch complete: 0 succeeded, 2 failed, 0 deferred\./);
+  assert.match(logText, /Batch complete: 0 succeeded, 2 failed, 0 needs review, 0 deferred\./);
 });
 
 test('thread IDs and MIME types are constrained before diagnostic logging', function () {
@@ -503,11 +509,8 @@ test('thread IDs and MIME types are constrained before diagnostic logging', func
   harness.run();
 
   const logText = assertLogsExcludePrivateFixtures(harness);
-  const errorLog = harness.logs.filter(function (entry) { return entry.text.startsWith('[JEV] Thread processing failed: '); })[0];
-  assert.ok(errorLog);
-  const details = JSON.parse(errorLog.text.slice('[JEV] Thread processing failed: '.length));
-  assert.equal(details.threadId, '[invalid thread id]');
-  assert.equal(details.mimeType, 'other');
+  assert.match(logText, /Thread handed to manual review: local summary unavailable\./);
+  assert.doesNotMatch(logText, /Thread processing failed/);
   assert.ok(!logText.includes(FIXTURE_SENDER));
 });
 
@@ -580,32 +583,17 @@ test('provider error echoes are absent from diagnostics', function () {
   assert.ok(!harness.logs.map(function (entry) { return entry.text; }).join('\n').includes(echo));
 });
 
-test('decoder failures log safe thread, phase, stack, and MIME diagnostics', function () {
+test('decoder failures receive only the review label and do not expose source data in logs', function () {
   const harness = createHarness({ failDecode: true });
   harness.run();
-
-  const errorLog = harness.logs.filter(function (entry) { return entry.level === 'error'; })[0];
-  assert.ok(errorLog, 'a thread error should be logged');
-  const prefix = '[JEV] Thread processing failed: ';
-  assert.ok(errorLog.text.startsWith(prefix));
-  const details = JSON.parse(errorLog.text.slice(prefix.length));
-  assert.equal(details.threadId, FIXTURE_THREAD_ID);
-  assert.equal(details.phase, 'thread_read');
-  assert.equal(details.errorName, 'Error');
-  assert.equal(details.message, 'Could not decode string.');
-  assert.equal(details.stack, '[omitted for body decoding failure]');
-  assert.equal(details.messageOrdinal, 1);
-  assert.equal(details.mimePartPath, '0.0');
-  assert.equal(details.mimeType, 'text/plain');
-  assert.equal(details.encodedDataLength, harness.encodedBody.length);
-
-  const allLogs = harness.logs.map(function (entry) { return entry.text; }).join('\n');
-  [FIXTURE_BODY, FIXTURE_BODY.slice(0, 15), FIXTURE_SUBJECT, FIXTURE_SENDER, API_KEY, harness.encodedBody].forEach(function (secret) {
-    assert.ok(!allLogs.includes(secret), 'logs must not contain ' + secret);
-  });
   assert.equal(harness.counters.fetches, 0, 'classification API must not be called after decoding fails');
-  assert.equal(harness.counters.batchModifies, 0, 'eligible Gmail messages must not be labeled after decoding fails');
-  assert.equal(harness.counters.labelCreates, 0, 'no Gmail labels should be created for this failed thread');
+  assert.equal(harness.counters.batchModifies, 1, 'eligible Gmail messages receive the review label after decoding fails');
+  assert.deepEqual(harness.counters.batchModifyCalls[0].ids, ['eligible-message-' + FIXTURE_THREAD_ID]);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
+  assert.equal(harness.counters.labelCreates, 1, 'only the review label should be created');
+  assert.equal(harness.counters.fetches, 0, 'classification API must not be called after decoding fails');
+  assertLogsExcludePrivateFixtures(harness);
+  assert.ok(!harness.logs.map(function (entry) { return entry.text; }).join('\n').includes(FIXTURE_THREAD_ID), 'review handoff logs must not expose message or thread IDs');
 });
 
 test('valid body decoding continues through classification and labeling', function () {
@@ -847,8 +835,9 @@ test('unsafe local mail cannot create the processed label when it does not exist
   const harness = createHarness({ missingProcessedLabel: true, threadBodies: { [FIXTURE_THREAD_ID]: 'password: confidential-local-value-943.' } });
   harness.run();
   assert.equal(harness.counters.fetches, 0);
-  assert.equal(harness.counters.labelCreates, 0);
-  assert.equal(harness.counters.batchModifies, 0);
+  assert.equal(harness.counters.labelCreates, 1);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
 });
 
 test('HTML, entities, line endings, and Unicode are normalized before local summarization', function () {
@@ -876,22 +865,26 @@ test('local summary is capped at 800 characters and contains complete sentences 
   assert.ok(/[.!?]$/.test(summary), 'the summary must end at a complete sentence');
 });
 
-test('empty eligible message fails the thread before fetch or label changes', function () {
+test('empty eligible message is routed to review without classification or normal labels', function () {
   const harness = createHarness({ threadBodies: { [FIXTURE_THREAD_ID]: '<div>\n &nbsp; \n</div>' } });
-  harness.run();
+  const result = harness.run();
   assert.equal(harness.counters.fetches, 0);
   assert.equal(harness.requests.length, 0);
-  assert.equal(harness.counters.batchModifies, 0);
-  assert.equal(harness.counters.labelCreates, 0);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].ids, ['eligible-message-' + FIXTURE_THREAD_ID]);
+  assert.equal(harness.counters.labelCreates, 1);
+  assert.equal(result.summary.needsReview, 1, 'review routing is counted only after successful labeling');
 });
 
-test('credential-only message fails closed without a placeholder summary', function () {
+test('credential-only message is routed to review without a placeholder summary', function () {
   const harness = createHarness({ threadBodies: { [FIXTURE_THREAD_ID]: 'password: credential-only-932\nhttps://private.example/reset?token=only-url-932\n> quoted text' } });
   harness.run();
   assert.equal(harness.counters.fetches, 0);
   assert.equal(harness.requests.length, 0);
-  assert.equal(harness.counters.batchModifies, 0);
-  assert.equal(harness.counters.labelCreates, 0);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
+  assert.equal(harness.counters.labelCreates, 1);
 });
 
 test('summaries stay within the per-message boundary and assessment contains only summaries', function () {
@@ -1005,7 +998,7 @@ test('malformed batch answers fail every member before any label update', functi
   assert.equal(harness.counters.fetches, 1);
   assert.equal(harness.counters.batchModifies, 0);
   assert.equal(harness.counters.labelCreates, 0);
-  assert.match(harness.logs.map(function (entry) { return entry.text; }).join('\n'), /0 succeeded, 2 failed, 0 deferred/);
+  assert.match(harness.logs.map(function (entry) { return entry.text; }).join('\n'), /0 succeeded, 2 failed, 0 needs review, 0 deferred/);
 });
 
 test('missing batch answers fail every member before any label update', function () {
@@ -1015,19 +1008,124 @@ test('missing batch answers fail every member before any label update', function
   assert.equal(harness.counters.fetches, 1);
   assert.equal(harness.counters.batchModifies, 0);
   assert.equal(harness.counters.labelCreates, 0);
-  assert.match(harness.logs.map(function (entry) { return entry.text; }).join('\n'), /0 succeeded, 2 failed, 0 deferred/);
+  assert.match(harness.logs.map(function (entry) { return entry.text; }).join('\n'), /0 succeeded, 2 failed, 0 needs review, 0 deferred/);
 });
 
-test('a decoded message above the local size bound fails before provider fetch or labeling', function () {
+test('a decoded message above the local size bound is routed to review without provider fetch', function () {
   const body = 'private oversized body ' + 'x'.repeat(140000) + ' PRIVATE-ORIGINAL-TAIL';
   const harness = createHarness({ threadBodies: { 'oversized-thread': body }, threadId: 'oversized-thread', selectPending: true });
   harness.run();
 
   assert.equal(harness.counters.fetches, 0);
-  assert.equal(harness.counters.batchModifies, 0);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
   assert.equal(harness.requests.length, 0);
   assertLogsExcludePrivateFixtures(harness, ['PRIVATE-ORIGINAL-TAIL']);
+  assert.equal(harness.counters.labelCreates, 1);
+});
+
+test('one unsafe message routes every eligible message to review and leaves excluded messages untouched', function () {
+  const specs = [
+    { id: 'eligible-good', body: 'A useful update is ready for the team.' },
+    { id: 'eligible-empty', body: '<div>&nbsp;</div>' },
+    { id: 'excluded-sent', labelIds: ['SENT'], body: 'A sent message must remain untouched.' },
+  ];
+  const harness = createHarness({ threadId: 'mixed-thread', messageSpecsByThread: { 'mixed-thread': specs } });
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 1);
+  assert.equal(result.summary.failed, 0);
+  assert.equal(harness.counters.fetches, 0);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].ids, ['eligible-good', 'eligible-empty']);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
+});
+
+test('review label is reused when it already exists', function () {
+  const harness = createHarness({ existingReviewLabel: true, threadBodies: { [FIXTURE_THREAD_ID]: '<div></div>' } });
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 1);
   assert.equal(harness.counters.labelCreates, 0);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['label-needs-review']);
+});
+
+test('review label creation failure counts as failure and does not classify', function () {
+  const harness = createHarness({ labelCreateError: new Error('private label create failure'), threadBodies: { [FIXTURE_THREAD_ID]: '<div></div>' } });
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 0);
+  assert.equal(result.summary.failed, 1);
+  assert.equal(harness.counters.fetches, 0);
+  assert.equal(harness.counters.batchModifies, 0);
+  assert.equal(harness.counters.labelCreates, 1);
+});
+
+test('review label modification failure counts as failure without falling through to classification', function () {
+  const harness = createHarness({ existingReviewLabel: true, reviewModifyError: new Error('private label modification failure'), threadBodies: { [FIXTURE_THREAD_ID]: '<div></div>' } });
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 0);
+  assert.equal(result.summary.failed, 1);
+  assert.equal(harness.counters.fetches, 0);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['label-needs-review']);
+});
+
+test('Gmail thread read and provider failures do not receive the review label', function () {
+  const gmailFailure = createHarness({ threadReadErrorThreadId: FIXTURE_THREAD_ID });
+  const gmailResult = gmailFailure.run();
+  assert.equal(gmailResult.summary.needsReview, 0);
+  assert.equal(gmailFailure.counters.batchModifies, 0);
+
+  const providerFailure = createHarness({ fetchStatus: 400 });
+  const providerResult = providerFailure.run();
+  assert.equal(providerResult.summary.needsReview, 0);
+  assert.equal(providerFailure.counters.batchModifies, 0);
+  assert.equal(providerFailure.counters.labelCreates, 0);
+});
+
+test('oversized eligible ID sets are rejected before review label creation', function () {
+  const specs = Array.from({ length: 1001 }, function (_, index) {
+    return { id: 'eligible-' + index, body: index === 0 ? '<div></div>' : 'Must not need decoding after first rejection.' };
+  });
+  const harness = createHarness({ threadId: 'oversized-id-thread', messageSpecsByThread: { 'oversized-id-thread': specs } });
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 0);
+  assert.equal(result.summary.failed, 1);
+  assert.equal(harness.counters.fetches, 0);
+  assert.equal(harness.counters.labelCreates, 0, 'size validation occurs before label lookup or creation');
+  assert.equal(harness.counters.batchModifies, 0, 'oversized IDs are never partially labeled');
+});
+
+test('search hands review-labeled threads to the user until the review label is removed', function () {
+  const harness = createHarness({ threadBodies: { [FIXTURE_THREAD_ID]: '<div></div>' } });
+  harness.run();
+  assert.match(harness.counters.labelQueries[0], /-label:JEV/);
+  assert.match(harness.counters.labelQueries[0], /-label:Jev-Needs-Review/);
+});
+
+test('singleton token rejection routes to review before flushing a healthy pending thread', function () {
+  const harness = createHarness({ threadId: 'token-thread', candidateCount: 2, threadBodies: {
+    'token-thread-0': 'A healthy message is ready for review.',
+    'token-thread-1': 'TOKEN_LIMIT_FIXTURE marks this safe sentence as a singleton that exceeds the configured assessment limit.',
+  } });
+  harness.evaluate("var originalAssessment = getJevBatchAssessment_; getJevBatchAssessment_ = function(items, model, config) { var a = originalAssessment(items, model, config); if (items.some(function(item) { return item.threadData.state.messages.some(function(message) { return message.summary.indexOf('TOKEN_LIMIT_FIXTURE') >= 0; }); })) a.estimatedRequestTokens = config.advanced.maxRequestTokens + 1; return a; }");
+  const result = harness.run();
+  assert.equal(result.summary.succeeded, 1);
+  assert.equal(result.summary.needsReview, 1);
+  assert.equal(harness.counters.fetches, 1, 'only the healthy thread is submitted');
+  assert.deepEqual(harness.counters.batchModifyCalls[0].ids, ['eligible-message-token-thread-1']);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
+  assert.deepEqual(harness.counters.batchModifyCalls[1].ids, ['eligible-message-token-thread-0']);
+});
+
+test('successful review routing is recorded separately from classification in run history', function () {
+  const harness = createHarness({ threadBodies: { [FIXTURE_THREAD_ID]: '<div></div>' } });
+  const result = harness.run();
+  assert.equal(result.summary.succeeded, 0);
+  assert.equal(result.summary.needsReview, 1);
+  assert.equal(result.summary.failed, 0);
+  const lastRun = harness.getUiState().lastRuns[0];
+  assert.equal(lastRun.succeeded, 0);
+  assert.equal(lastRun.needsReview, 1);
+  assert.equal(lastRun.failed, 0);
 });
 
 test('outbound state excludes metadata and keeps only locally generated summaries', function () {
@@ -1076,8 +1174,8 @@ test('exhausted provider rate limits fail the sent batch and defer remaining can
   assert.ok(harness.counters.threadReads < 20);
   assert.equal(harness.counters.batchModifies, 0);
   assert.match(logText, /Stopping this batch after a rate-limit error/);
-  assert.match(logText, /0 succeeded, \d+ failed, \d+ deferred\./);
-  const summary = /Batch complete: 0 succeeded, (\d+) failed, (\d+) deferred\./.exec(logText);
+  assert.match(logText, /0 succeeded, \d+ failed, \d+ needs review, \d+ deferred\./);
+  const summary = /Batch complete: 0 succeeded, (\d+) failed, \d+ needs review, (\d+) deferred\./.exec(logText);
   assert.ok(summary);
   assert.ok(Number(summary[1]) > 0);
   assert.ok(Number(summary[2]) > 0);
@@ -1086,27 +1184,19 @@ test('exhausted provider rate limits fail the sent batch and defer remaining can
 
 test('invalid byte array elements still fail decoding', function () {
   const harness = createHarness({ encodedBody: [65, 256, 67], bodySize: 1 });
-  harness.run();
-
-  const errorLog = harness.logs.filter(function (entry) { return entry.text.startsWith('[JEV] Thread processing failed: '); })[0];
-  assert.ok(errorLog);
-  const details = JSON.parse(errorLog.text.slice('[JEV] Thread processing failed: '.length));
-  assert.equal(details.message, 'Body decoding failed.');
-  assert.equal(details.byteArrayValidationValid, false);
-  assert.equal(details.byteArrayInvalidElementCount, 1);
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 1);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
   assert.equal(harness.counters.fetches, 0);
 });
 
 test('invalid declared byte array size still fails decoding', function () {
   const harness = createHarness({ encodedBody: [65, 66, 67], bodySize: -1 });
-  harness.run();
-
-  const errorLog = harness.logs.filter(function (entry) { return entry.text.startsWith('[JEV] Thread processing failed: '); })[0];
-  assert.ok(errorLog);
-  const details = JSON.parse(errorLog.text.slice('[JEV] Thread processing failed: '.length));
-  assert.equal(details.message, 'Body decoding failed.');
-  assert.equal(details.expectedBodySize, undefined);
-  assert.equal(details.bodySizeMatches, false);
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 1);
+  assert.equal(harness.counters.batchModifies, 1);
+  assert.deepEqual(harness.counters.batchModifyCalls[0].addLabelIds, ['created-label-Jev-Needs-Review']);
   assert.equal(harness.counters.fetches, 0);
 });
 
@@ -1134,7 +1224,7 @@ test('Gmail batchModify quota errors stop the batch and defer later threads', fu
   assert.equal(harness.counters.threadReads, 3);
   assert.equal(harness.counters.fetches, 1);
   assert.equal(harness.counters.batchModifies, 1);
-  assert.match(logText, /Batch complete: 0 succeeded, 1 failed, 2 deferred\./);
+  assert.match(logText, /Batch complete: 0 succeeded, 1 failed, 0 needs review, 2 deferred\./);
 });
 
 test('Gmail thread-read quota errors stop without flushing pending threads', function () {
@@ -1150,7 +1240,7 @@ test('Gmail thread-read quota errors stop without flushing pending threads', fun
   assert.equal(harness.counters.threadReads, 3);
   assert.equal(harness.counters.fetches, 0, 'pending threads must not be sent after a Gmail quota error');
   assert.equal(harness.counters.batchModifies, 0, 'pending threads must not be labeled after a Gmail quota error');
-  assert.match(logText, /Batch complete: 0 succeeded, 1 failed, 2 deferred\./);
+  assert.match(logText, /Batch complete: 0 succeeded, 1 failed, 0 needs review, 2 deferred\./);
 });
 
 test('UI state exposes a configured-key flag without returning the API key', function () {
@@ -1329,15 +1419,15 @@ test('settings save persists a custom fallback and key replacement without retur
   const harness = createHarness();
   const state = harness.getUiState();
   const settings = state.settings;
-  settings.fallbackLabel = 'Jev-Needs-Review';
+  settings.fallbackLabel = 'Jev-Custom-Fallback';
   const result = saveUiSettings(harness, { expectedRevision: state.revision, settings: settings, apiKeyAction: 'replace', apiKey: 'new-private-api-key' });
   assert.equal(result.ok, true);
   assert.equal(result.apiKeyConfigured, true);
-  assert.equal(result.settings.fallbackLabel, 'Jev-Needs-Review');
+  assert.equal(result.settings.fallbackLabel, 'Jev-Custom-Fallback');
   assert.ok(!JSON.stringify(result).includes('new-private-api-key'));
   const refreshed = harness.getUiState();
   assert.equal(refreshed.revision, state.revision + 1);
-  assert.equal(refreshed.settings.fallbackLabel, 'Jev-Needs-Review');
+  assert.equal(refreshed.settings.fallbackLabel, 'Jev-Custom-Fallback');
   assert.ok(!JSON.stringify(refreshed).includes('new-private-api-key'));
 });
 
@@ -1567,4 +1657,33 @@ test('provider retry sleep reaching the execution deadline defers the unclassifi
   assert.equal(result.summary.succeeded, 0);
   assert.equal(result.summary.deferred, 17);
   assert.ok(harness.counters.fetches < 5, 'retry sequence should stop before another request when its wait reaches the deadline');
+});
+
+
+test('an existing review marker holds new eligible replies before local summarization', function () {
+  const harness = createHarness({ existingReviewLabel: true, messageSpecsByThread: { [FIXTURE_THREAD_ID]: [
+    { id: 'held-message-private', labelIds: ['INBOX', 'label-needs-review'], body: 'Old held message.' },
+    { id: 'new-message-private', body: 'New reply must remain local.' },
+    { id: 'sent-private', labelIds: ['SENT'], body: 'Sent reply.' },
+  ] } });
+  harness.evaluate('summarizeJevMessage_ = function () { throw new Error("must not summarize held threads"); }');
+  const result = harness.run();
+  assert.equal(result.summary.needsReview, 1);
+  assert.equal(harness.counters.fetches, 0);
+  assert.deepEqual(harness.counters.batchModifyCalls, [{ ids: ['held-message-private', 'new-message-private'], addLabelIds: ['label-needs-review'] }]);
+});
+
+test('review label failures log only bounded identifier-free metadata', function () {
+  for (const setting of ['labelCreateError', 'reviewModifyError']) {
+    const options = { threadBodies: { [FIXTURE_THREAD_ID]: '<div></div>' } };
+    options[setting] = new Error(FIXTURE_THREAD_ID + ' eligible-message-' + FIXTURE_THREAD_ID + ' private exception');
+    const harness = createHarness(options);
+    harness.run();
+    const text = harness.logs.map(function (entry) { return entry.text; }).join('\n');
+    assert.ok(!text.includes(FIXTURE_THREAD_ID));
+    assert.ok(!text.includes('eligible-message-'));
+    assert.ok(!text.includes('private exception'));
+    assert.match(text, /Manual review labeling failed/);
+    assert.match(text, /label_resolution|gmail_labeling/);
+  }
 });
