@@ -1,5 +1,4 @@
 const JEV_CLASSIFY_TOKEN_CHARS_PER_TOKEN_ = 4;
-const JEV_BODY_TRUNCATION_MARKER_ = '\n\n[truncated]';
 const JEV_PROCESSED_LABEL_ = 'JEV';
 const JEV_TRIGGER_HANDLER_ = 'runJevBatch';
 const JEV_TRIGGER_INTERVAL_PROPERTY_ = 'JEV_INTERNAL_TRIGGER_INTERVAL_MINUTES';
@@ -8,8 +7,6 @@ const JEV_TRIGGER_RECORD_PROPERTY_ = 'JEV_INTERNAL_TRIGGER_RECORD';
 const JEV_COOLDOWN_UNTIL_PROPERTY_ = 'JEV_INTERNAL_GMAIL_COOLDOWN_UNTIL';
 const JEV_COOLDOWN_STEP_PROPERTY_ = 'JEV_INTERNAL_GMAIL_COOLDOWN_STEP';
 const JEV_GMAIL_COOLDOWN_MINUTES_ = [15, 30, 60];
-const JEV_HTTP_ERROR_BODY_MAX_LENGTH_ = 2000;
-const JEV_HTTP_ERROR_BODY_UNAVAILABLE_ = '[response body unavailable]';
 const JEV_GMAIL_QUOTA_COSTS_ = {
   'threads.list': 10,
   'threads.get': 40,
@@ -161,7 +158,6 @@ function runJevBatchLocked_(config, metrics, runContext) {
   let labelIdsByName;
   try {
     labelIdsByName = getLabelIdsByName_(metrics);
-    getOrCreateLabelId_(JEV_PROCESSED_LABEL_, labelIdsByName, metrics);
   } catch (error) {
     if (isJevDeadlineError_(error)) return { succeeded: 0, failed: 0, deferred: batch.length, stopped: true, reason: 'deadline' };
     recordJevRateLimitIfNeeded_(error, true, config);
@@ -177,7 +173,7 @@ function runJevBatchLocked_(config, metrics, runContext) {
     const threadRef = batch[i];
     let threadData;
     try {
-      threadData = threadToJevState_(threadRef.id, metrics);
+      threadData = threadToJevState_(threadRef.id, metrics, config);
     } catch (error) {
       if (isJevDeadlineError_(error)) { summary.stopped = true; summary.deferred += batch.length - i; break; }
       error = addJevDiagnosticContextSafely_(error, { processingPhase: 'thread_read' });
@@ -319,6 +315,8 @@ function getSafeErrorMessage_(error, apiKey) {
     'JEV API response has an invalid category answer.', 'Thread contains no eligible messages.',
     'Thread exceeds the Gmail batch label limit.', 'Gmail did not return a label ID.',
     'JEV request exceeds supported token limits.',
+    'Local summary input exceeds safe limits.', 'Local summary could not be safely produced.',
+    'Local summary validation failed.',
     'JEV_SCOPE must be INBOX or ALL.',
     'JEV_INTERVAL_MINUTES must be 1, 5, 10, 15, or 30.',
     'JEV_MODEL must not be empty.',
@@ -434,18 +432,6 @@ function logThreadProcessingError_(threadId, error, apiKey) {
   if (Number.isInteger(tokenLimit) && tokenLimit >= 0 && tokenLimit <= 1000000) {
     details.tokenLimit = tokenLimit;
   }
-  const status = getSafeHttpStatus_(error);
-  const responseBody = getJevPropertySafely_(context, 'responseBody');
-  if (status !== null && status >= 400 && status <= 599 && typeof responseBody === 'string') {
-    let safeResponseBody = responseBody;
-    safeResponseBody = redactJevKeys_(safeResponseBody, typeof apiKey === 'object' ? apiKey : { apiKey: apiKey });
-    if (safeResponseBody.length > JEV_HTTP_ERROR_BODY_MAX_LENGTH_) {
-      details.responseBody = safeResponseBody.slice(0, JEV_HTTP_ERROR_BODY_MAX_LENGTH_);
-      details.responseBodyTruncated = true;
-    } else {
-      details.responseBody = safeResponseBody;
-    }
-  }
   console.error('[JEV] Thread processing failed: ' + JSON.stringify(details));
 }
 
@@ -526,7 +512,7 @@ function findUncategorizedThreads_(config, metrics, runContext) {
 }
 
 /** Serializes incoming messages in the thread, excluding Spam, Trash, Sent, and Drafts. */
-function threadToJevState_(threadId, metrics) {
+function threadToJevState_(threadId, metrics, config) {
   beforeJevGmailRequest_();
   metrics.gmailAttempts['threads.get'] += 1;
   const thread = Gmail.Users.Threads.get('me', threadId, { format: 'full' });
@@ -543,23 +529,136 @@ function threadToJevState_(threadId, metrics) {
     throw new Error('Thread contains no eligible messages.');
   }
 
+  const decodedBudget = { length: 0 };
   const messages = eligibleMessages.map(function (message, index) {
-    const payload = message.payload || {};
-    const sender = getHeaderValue_(payload.headers, 'From');
-    const subject = getHeaderValue_(payload.headers, 'Subject');
-    let body;
-    try {
-      body = getPlainTextBody_(payload, index + 1);
-    } catch (error) {
-      throw error;
-    }
-    return { sender: sender, subject: subject, body: body };
+    const body = getPlainTextBody_(message.payload || {}, index + 1, decodedBudget);
+    if (body.length > 100000) throw new Error('Local summary input exceeds safe limits.');
+    return { summary: summarizeJevMessage_(body, config) };
   });
 
   return {
     state: { messages: messages },
     messageIds: eligibleMessages.map(function (message) { return message.id; }),
   };
+}
+
+/** Normalize before detection, including entity-encoded credential delimiters. */
+function normalizeJevSummaryText_(text) {
+  let value = String(text).normalize('NFKC').replace(/\r\n?/g, '\n');
+  for (let pass = 0; pass < 3; pass += 1) {
+    value = value.replace(/&#(x[0-9a-f]+|[0-9]+);?/gi, function (match, code) {
+      const point = code.charAt(0).toLowerCase() === 'x' ? parseInt(code.slice(1), 16) : parseInt(code, 10);
+      return point > 0 && point <= 0x10FFFF ? String.fromCodePoint(point) : ' ';
+    }).replace(/&(nbsp|amp|lt|gt|quot|apos|colon|sol|equals|tab|newline|shy);/gi, function (match, name) {
+      return {nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", colon: ':', sol: '/', equals: '=', tab: '\t', newline: '\n', shy: ''}[name.toLowerCase()];
+    });
+  }
+  return value.normalize('NFKC').replace(/\r\n?/g, '\n')
+    .replace(/\p{Default_Ignorable_Code_Point}/gu, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '');
+}
+
+/** Shared detector: remove sensitive blocks rather than retain wrapped values. */
+function sanitizeJevSummaryText_(text, config) {
+  let value = normalizeJevSummaryText_(text);
+  const keys = (config && config.providers || []).map(function (p) { return p.apiKey; });
+  if (config && config.apiKey) keys.push(config.apiKey);
+  value = value.replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\n]*PRIVATE KEY-----|$)/gi, '\n');
+  const credentialLabel = '(?:password|passwd|pwd|passphrase|passcode|pin|otp|mfa|2fa|login|login[ _-]*id|user(?:[ _-]*(?:name|id))?|(?:one[ _-]*time|security|login|verification|authentication|mfa|2fa)[ _-]*code|api[ _-]*(?:key|token)|access[ _-]*token|refresh[ _-]*token|client[ _-]*secret|(?:aws[ _-]*)?secret[ _-]*access[ _-]*key|(?:aws[ _-]*)?session[ _-]*token|connection[ _-]*string|database[ _-]*url|credentials?|token|secret)';
+  const codeLabel = '(?:otp|pin|passcode|mfa|2fa|(?:one[ _-]*time|security|login|verification|authentication|mfa|2fa)[ _-]*code)';
+  const undelimitedCode = new RegExp('\\b' + codeLabel + '\\b\\s+\\S+', 'i');
+  const emptyLabel = new RegExp('(?:^|\\b)(?:' + credentialLabel + '["\']?\\s*(?:[:=]|\\bis\\b)|' + codeLabel + ')\\s*$', 'i');
+  const sensitive = new RegExp('(?:\\b(?:proxy[- ]?)?authorization["\']?\\s*:|\\b(?:bearer|basic|token)\\s+\\S+|\\b' + credentialLabel + '\\b["\']?\\s*(?:[:=]|\\bis\\b)\\s*\\S+|\\b(?:one[ _-]*time|security|login|verification|authentication|mfa|2fa)[ _-]*code\\b\\s+\\S+|\\b(?:AKIA|ASIA)[A-Z0-9]{16}\\b|\\b(?:gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]+|AIza[A-Za-z0-9_-]{20,}|ya29\\.[A-Za-z0-9_-]+|xox[baprs]-[A-Za-z0-9-]+|sk-[A-Za-z0-9_-]{16,})|\\beyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+|\\b(?:mongodb(?:\\+srv)?|postgres(?:ql)?|mysql|redis|amqps?|sqlserver):\\/\\/|\\b(?:Server|Data Source|AccountKey|SharedAccessKey)\\s*=|-----BEGIN .*PRIVATE KEY-----)', 'i');
+  // 1 means a label is awaiting its first value (blank lines may intervene);
+  // 2 means a value was consumed and continuation lasts to the next blank.
+  let sensitiveContinuation = 0;
+  value = value.split('\n').filter(function (line) {
+    if (!line.trim()) {
+      if (sensitiveContinuation === 2) sensitiveContinuation = 0;
+      return sensitiveContinuation === 1;
+    }
+    // Empty credential labels may introduce a wrapped/multiline value. Drop
+    // the following block through its blank separator rather than guess its end.
+    // Inspect new labels even inside a discarded block: a later empty label
+    // may introduce a value after a blank line.
+    if (emptyLabel.test(line) || /\b(?:proxy[- ]?)?authorization["']?\s*:\s*(?:[A-Za-z][A-Za-z0-9_-]*)?\s*$/i.test(line)) {
+      sensitiveContinuation = 1;
+      return false;
+    }
+    if (sensitiveContinuation === 1) { sensitiveContinuation = 2; return false; }
+    if (sensitiveContinuation === 2) return false;
+    const lineSensitive = sensitive.test(line) || undelimitedCode.test(line) || keys.some(function (key) {
+      return key && line.indexOf(normalizeJevSummaryText_(key)) >= 0;
+    });
+    // Populated labels can also contain wrapped values. Treat the remaining
+    // nonblank block as sensitive regardless of indentation.
+    if (lineSensitive) sensitiveContinuation = 2;
+    return !lineSensitive;
+  }).join('\n');
+  // Drop URLs, including userinfo, query strings, fragments, and bare www links.
+  return value.replace(/\b[a-z][a-z0-9+.-]*:[^\s<>"']+|\/\/[^\s<>"']+|\bwww\.[^\s<>"']+|\b(?:[a-z0-9_-]+\.)+[a-z]{2,63}\b(?:[^\s<>"']*)|\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?(?:[/?#][^\s<>"']*)?/gi, ' ');
+}
+
+function splitJevSentences_(text) {
+  const value = String(text);
+  const sentences = [];
+  let start = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    if (!/[.!?。！？]/.test(value.charAt(i))) continue;
+    if (value.charAt(i) === '.') {
+      if (/\d/.test(value.charAt(i - 1)) && /\d/.test(value.charAt(i + 1))) continue;
+      // Avoid treating titles, initials, and common abbreviations as complete
+      // sentences that may be independently retained during budget trimming.
+      const word = value.slice(start, i + 1).match(/(?:^|\s)([^\s]+)$/);
+      if (i + 1 < value.length && word && /^(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|approx|e\.g|i\.e|a\.m|p\.m|[A-Za-z](?:\.[A-Za-z])*)\.$/i.test(word[1])) continue;
+      if (i + 1 < value.length && !/[\s.!?"'”’)]/.test(value.charAt(i + 1))) continue;
+    }
+    let end = i + 1;
+    while (end < value.length && /[.!?。！？"'”’)]/.test(value.charAt(end))) end += 1;
+    sentences.push(value.slice(start, end).trim());
+    start = end;
+    i = end - 1;
+  }
+  if (value.slice(start).trim()) sentences.push(value.slice(start).trim());
+  return sentences;
+}
+
+function summarizeJevMessage_(body, config) {
+  try {
+    if (typeof body !== 'string' || body.length > 100000) throw new Error();
+    const sanitized = sanitizeJevSummaryText_(body, config);
+    const lines = sanitized.split('\n');
+    const retained = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i].trim();
+      if (/^(?:--\s*$|On .{0,300}wrote:|From:|Sent:|_{5,}|-{5,}\s*(?:Original|Forwarded))/i.test(line) || /^(?:Best regards|Kind regards|Sincerely|Sent from my)\b/i.test(line) || /^(?:Thanks|Regards|Cheers)[,!]?$/i.test(line)) break;
+      if (!/^>/.test(line)) retained.push(line);
+    }
+    const seen = Object.create(null);
+    const selected = [];
+    splitJevSentences_(retained.join(' ').replace(/\s+/g, ' ')).forEach(function (sentence) {
+      sentence = sentence.trim();
+      const key = sentence.toLowerCase();
+      if (!/[\p{L}\p{N}]/u.test(sentence) || sentence.length < 12 || seen[key]) return;
+      seen[key] = true;
+      if (!/[.!?。！？][\"'”’)]*$/.test(sentence)) return;
+      if (selected.length < 3 && selected.join(' ').length + (selected.length ? 1 : 0) + sentence.length <= 800) selected.push(sentence);
+    });
+    const summary = selected.join(' ');
+    validateJevSummaryState_({ messages: [{ summary: summary }] }, config);
+    return summary;
+  } catch (error) {
+    throw new Error('Local summary could not be safely produced.');
+  }
+}
+
+/** Copy an exact allowlist at the network boundary. No Gmail metadata survives. */
+function validateJevSummaryState_(state, config) {
+  if (!state || Object.keys(state).join(',') !== 'messages' || !Array.isArray(state.messages) || !state.messages.length) throw new Error('Local summary validation failed.');
+  return { messages: Array.from(state.messages, function (message) {
+    if (!message || Object.keys(message).join(',') !== 'summary' || typeof message.summary !== 'string' || !message.summary.trim() || message.summary.length > 800 || sanitizeJevSummaryText_(message.summary, config) !== message.summary) throw new Error('Local summary validation failed.');
+    return { summary: message.summary };
+  }) };
 }
 
 function getHeaderValue_(headers, name) {
@@ -570,12 +669,14 @@ function getHeaderValue_(headers, name) {
   return match ? String(match.value || '') : '';
 }
 
-function getPlainTextBody_(payload, messageOrdinal) {
+function getPlainTextBody_(payload, messageOrdinal, decodedBudget) {
   const bodies = { plain: [], html: [] };
   collectBodyParts_(payload, bodies, false, {
     messageOrdinal: messageOrdinal,
+    decodedBudget: decodedBudget,
     mimePartPath: '0',
   });
+  if (bodies.plain.concat(bodies.html).join('\n\n').length > 100000) throw new Error('Local summary input exceeds safe limits.');
   if (bodies.plain.length) return bodies.plain.join('\n\n').trim();
   if (bodies.html.length) return htmlToPlainText_(bodies.html.join('\n\n'));
   return '';
@@ -586,6 +687,7 @@ function collectBodyParts_(part, bodies, isAttachment, context) {
   const mimeType = normalizeMimeType_(part.mimeType);
   const data = part.body && part.body.data;
   if (data !== undefined && data !== null) {
+    if ((typeof data === 'string' && data.length > 133336) || (Array.isArray(data) && data.length > 100000)) throw new Error('Local summary input exceeds safe limits.');
     let decoded;
     try {
       decoded = decodeBase64Url_(data, part.body.size);
@@ -616,6 +718,11 @@ function collectBodyParts_(part, bodies, isAttachment, context) {
       });
       throw error;
     }
+    if (context.decodedBudget) {
+      context.decodedBudget.length += decoded.length;
+      if (context.decodedBudget.length > 500000) throw new Error('Local summary input exceeds safe limits.');
+    }
+    if (decoded.length > 100000) throw new Error('Local summary input exceeds safe limits.');
     if (mimeType === 'text/plain') bodies.plain.push(decoded);
     else if (mimeType === 'text/html') bodies.html.push(decoded);
   }
@@ -623,6 +730,7 @@ function collectBodyParts_(part, bodies, isAttachment, context) {
     collectBodyParts_(child, bodies, Boolean(child && child.filename), {
       messageOrdinal: context.messageOrdinal,
       mimePartPath: context.mimePartPath + '.' + index,
+      decodedBudget: context.decodedBudget,
     });
   });
 }
@@ -816,16 +924,18 @@ function getBase64UrlShapeMetadataSafely_(encoded, optionalExpectedSize) {
 
 function htmlToPlainText_(html) {
   return String(html)
-    .replace(/<\s*(script|style)[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, ' ')
+    .replace(/<\s*(script|style)[^>]*>[\s\S]*?<\/\s*\1\s*>/gi, '')
+    .replace(/(?:<\s*\/?(?:p|div|li|tr|h[1-6]|blockquote|section|article|ul|ol|table|td|th)\b[^>]*>[ \t\r\n]*)+/gi, '\n')
     .replace(/<\s*br\s*\/?>/gi, '\n')
-    .replace(/<\s*\/(p|div|li|tr|h[1-6])\s*>/gi, '\n')
-    .replace(/<[^>]*>/g, ' ')
+    .replace(/<[^>]*>/g, '')
     .replace(/&nbsp;|&#160;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
     .replace(/&gt;/gi, '>')
     .replace(/&quot;/gi, '"')
     .replace(/&#39;|&#x27;/gi, "'")
+    .replace(/&(?:tab|newline);/gi, '\n')
+    .replace(/&shy;/gi, '')
     .replace(/[ \t]+/g, ' ')
     .replace(/ *\n */g, '\n')
     .trim();
@@ -836,53 +946,23 @@ function estimateJevTokenCount_(serializedJson) {
   return Math.ceil(String(serializedJson).length / JEV_CLASSIFY_TOKEN_CHARS_PER_TOKEN_);
 }
 
-/** Truncates only message bodies when a singleton thread exceeds either request limit. */
+/** Reduce summaries by complete sentences; never restore source mail. */
 function truncateJevThreadToFit_(item, model, config) {
-  const originalAssessment = getJevBatchAssessment_([item], model, config);
-  if (!getJevBatchTokenViolation_(originalAssessment, config)) return;
-
   const messages = item.threadData.state.messages;
-  const originalBodies = messages.map(function (message) { return message.body; });
-  const longestBodyLength = originalBodies.reduce(function (longest, body) {
-    return Math.max(longest, body ? body.length : 0);
-  }, 0);
-  if (!longestBodyLength) return;
-
-  function applyBodyLengthCap(cap) {
+  while (getJevBatchTokenViolation_(getJevBatchAssessment_([item], model, config), config)) {
+    let selected = -1;
+    let replacement = '';
     messages.forEach(function (message, index) {
-      const body = originalBodies[index];
-      if (!body || body.length <= cap) {
-        message.body = body;
-        return;
+      const sentences = splitJevSentences_(message.summary);
+      if (sentences.length > 1 && (selected < 0 || message.summary.length > messages[selected].summary.length)) {
+        selected = index;
+        replacement = sentences.slice(0, -1).join(' ');
       }
-      let prefixLength = cap;
-      // Do not leave half of a UTF-16 surrogate pair at the truncation boundary.
-      if (prefixLength > 0 && prefixLength < body.length) {
-        const last = body.charCodeAt(prefixLength - 1);
-        const next = body.charCodeAt(prefixLength);
-        if (last >= 0xD800 && last <= 0xDBFF && next >= 0xDC00 && next <= 0xDFFF) prefixLength -= 1;
-      }
-      message.body = body.slice(0, prefixLength) + JEV_BODY_TRUNCATION_MARKER_;
     });
+    // A single complete sentence per message is the minimum safe state.
+    if (selected < 0) return;
+    messages[selected].summary = replacement;
   }
-
-  // A zero-length cap checks whether fixed metadata and marker overhead can fit.
-  applyBodyLengthCap(0);
-  if (getJevBatchTokenViolation_(getJevBatchAssessment_([item], model, config), config)) {
-    originalBodies.forEach(function (body, index) { messages[index].body = body; });
-    return;
-  }
-
-  // Cap the longest bodies first so short messages remain intact when possible.
-  let low = 0;
-  let high = longestBodyLength;
-  while (low + 1 < high) {
-    const middle = Math.floor((low + high) / 2);
-    applyBodyLengthCap(middle);
-    if (getJevBatchTokenViolation_(getJevBatchAssessment_([item], model, config), config)) high = middle;
-    else low = middle;
-  }
-  applyBodyLengthCap(low);
 }
 
 /** Builds a complete Jev request and estimates its documented token limits. */
@@ -894,12 +974,12 @@ function getJevBatchAssessment_(items, model, config) {
 
   items.forEach(function (item, itemIndex) {
     const threadKey = 'item_' + ('000' + itemIndex).slice(-3);
-    state.threads[threadKey] = item.threadData.state;
+    state.threads[threadKey] = validateJevSummaryState_(item.threadData.state, config);
     categories.forEach(function (category) {
       const questionKey = threadKey + '__' + category.key;
       const question = {
         type: 'noul',
-        instructions: 'Use only state.threads.' + threadKey + ' (this thread’s eligible messages). Does this email thread fit the ' + category.label + ' category?',
+        instructions: 'Use only state.threads.' + threadKey + ' (local summaries of this thread’s eligible messages). Does this email thread fit the ' + category.label + ' category?',
         criteria: {
           true: category.description,
           false: 'The thread does not fit this category.',
@@ -1002,6 +1082,8 @@ function classifyThreadBatchWithProvider_(items, config, metrics, profile) {
   let response;
   for (let attempt = 0; attempt < config.advanced.providerAttempts; attempt += 1) {
     assertJevRunTime_();
+    Object.keys(assessment.payload.state.threads).forEach(function (key) { validateJevSummaryState_(assessment.payload.state.threads[key], config); });
+    requestOptions.payload = JSON.stringify(assessment.payload);
     metrics.classifierFetchAttempts += 1;
     try { response = UrlFetchApp.fetch(profile.apiUrl, requestOptions); } catch (networkError) { throw new Error('JEV provider request failed.'); }
     const responseStatus = response.getResponseCode();
@@ -1018,16 +1100,6 @@ function classifyThreadBatchWithProvider_(items, config, metrics, profile) {
   if (status < 200 || status >= 300) {
     const error = new Error('JEV API returned HTTP ' + status + '.');
     error.statusCode = status;
-    if (Number.isInteger(status) && status >= 400 && status <= 599) {
-      let responseBody = JEV_HTTP_ERROR_BODY_UNAVAILABLE_;
-      try {
-        const body = response.getContentText();
-        if (typeof body === 'string') responseBody = body;
-      } catch (ignoredBodyReadError) {
-        // Provider body diagnostics are best effort and never replace the HTTP error.
-      }
-      addJevDiagnosticContextSafely_(error, { responseBody: redactJevKeys_(responseBody, config) });
-    }
     throw error;
   }
 
