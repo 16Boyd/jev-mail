@@ -70,10 +70,10 @@ function executeJevRun_(source) {
     }
     const config = getJevConfig_();
     try { ensureJevTrigger_(config.intervalMinutes); } catch (ignoredTriggerRepair) {}
-    const runContext = { source: source, startedAt: startedAt, deadlineAt: startedAt + 4 * 60 * 1000, revision: config.revision, config: config };
+    const runContext = { source: source, startedAt: startedAt, deadlineAt: startedAt + 4 * 60 * 1000, revision: config.revision, config: config, providerCursor: 0 };
     JEV_ACTIVE_RUN_CONTEXT_ = runContext;
     if (source === 'scheduled' && (!config.enabled || !isJevScheduleEligible_(config, new Date()))) return { ok: true, skipped: true, reason: 'schedule_ineligible' };
-    if (!config.apiKey || !getEnabledJevCategories_(config).length) return { ok: true, skipped: true, reason: 'configuration_incomplete' };
+    if (!config.providers.some(function (p) { return p.apiKey; }) || !getEnabledJevCategories_(config).length) return { ok: true, skipped: true, reason: 'configuration_incomplete' };
     if (isJevCooldownActive_()) return { ok: true, skipped: true, reason: 'cooldown' };
     try { PropertiesService.getScriptProperties().setProperty(JEV_RUNNING_PROPERTY_, JSON.stringify({ startedAt: startedAt, source: source, revision: config.revision })); } catch (ignored) {}
     const summary = runJevBatchLocked_(config, metrics, runContext) || { succeeded: 0, failed: 0, deferred: 0 };
@@ -131,7 +131,7 @@ function runJevBatchLocked_(config, metrics, runContext) {
     console.log('[JEV] Disabled; no Gmail search or API request made.');
     return { succeeded: 0, failed: 0, deferred: 0 };
   }
-  if (!config.apiKey) {
+  if (!config.providers.some(function (p) { return p.apiKey; })) {
     console.error('[JEV] Enabled but JEV_API_KEY is empty; batch skipped.');
     return { succeeded: 0, failed: 0, deferred: 0 };
   }
@@ -182,7 +182,7 @@ function runJevBatchLocked_(config, metrics, runContext) {
       if (isJevDeadlineError_(error)) { summary.stopped = true; summary.deferred += batch.length - i; break; }
       error = addJevDiagnosticContextSafely_(error, { processingPhase: 'thread_read' });
       summary.failed += 1;
-      logThreadProcessingError_(threadRef.id, error, config.apiKey);
+      logThreadProcessingError_(threadRef.id, error, config);
       if (isJevRateLimitError_(error)) {
         recordJevRateLimitIfNeeded_(error, true, config);
         summary.stopped = true;
@@ -216,7 +216,7 @@ function runJevBatchLocked_(config, metrics, runContext) {
           tokenLimit: violation.tokenLimit,
         });
         summary.failed += 1;
-        logThreadProcessingError_(threadRef.id, sizeError, config.apiKey);
+        logThreadProcessingError_(threadRef.id, sizeError, config);
         continue;
       }
     }
@@ -438,9 +438,7 @@ function logThreadProcessingError_(threadId, error, apiKey) {
   const responseBody = getJevPropertySafely_(context, 'responseBody');
   if (status !== null && status >= 400 && status <= 599 && typeof responseBody === 'string') {
     let safeResponseBody = responseBody;
-    if (typeof apiKey === 'string' && apiKey.length > 0) {
-      safeResponseBody = safeResponseBody.split(apiKey).join('[redacted API key]');
-    }
+    safeResponseBody = redactJevKeys_(safeResponseBody, typeof apiKey === 'object' ? apiKey : { apiKey: apiKey });
     if (safeResponseBody.length > JEV_HTTP_ERROR_BODY_MAX_LENGTH_) {
       details.responseBody = safeResponseBody.slice(0, JEV_HTTP_ERROR_BODY_MAX_LENGTH_);
       details.responseBodyTruncated = true;
@@ -959,7 +957,29 @@ function getJevBatchTokenViolation_(assessment, config) {
 
 /** Sends a batch with nine uniquely keyed questions for each Gmail thread. */
 function classifyThreadBatch_(items, config, metrics) {
-  const assessment = getJevBatchAssessment_(items, config.model, config);
+  const profiles = config.providers || [{ id:'provider-1', apiUrl:config.apiUrl, model:config.model, apiKey:config.apiKey }];
+  const context = JEV_ACTIVE_RUN_CONTEXT_ || { providerCursor: 0 };
+  let lastError = null;
+  let rateLimitError = null;
+  for (let offset = 0; offset < profiles.length; offset += 1) {
+    const index = (context.providerCursor + offset) % profiles.length;
+    const profile = profiles[index];
+    if (!profile.apiKey) continue;
+    try {
+      const classifications = classifyThreadBatchWithProvider_(items, config, metrics, profile);
+      context.providerCursor = index;
+      return classifications;
+    } catch (error) {
+      if (isJevDeadlineError_(error)) throw error;
+      lastError = error;
+      if (isJevRateLimitError_(error)) rateLimitError = error;
+    }
+  }
+  throw rateLimitError || lastError || new Error('No configured provider key is available.');
+}
+
+function classifyThreadBatchWithProvider_(items, config, metrics, profile) {
+  const assessment = getJevBatchAssessment_(items, profile.model, config);
   const violation = getJevBatchTokenViolation_(assessment, config);
   if (violation) {
     const sizeError = new Error('JEV request exceeds supported token limits.');
@@ -974,7 +994,7 @@ function classifyThreadBatch_(items, config, metrics) {
   const requestOptions = {
     method: 'post',
     contentType: 'application/json',
-    headers: { Authorization: 'Bearer ' + config.apiKey },
+    headers: { Authorization: 'Bearer ' + profile.apiKey },
     payload: assessment.serializedPayload,
     followRedirects: false,
     muteHttpExceptions: true,
@@ -983,7 +1003,7 @@ function classifyThreadBatch_(items, config, metrics) {
   for (let attempt = 0; attempt < config.advanced.providerAttempts; attempt += 1) {
     assertJevRunTime_();
     metrics.classifierFetchAttempts += 1;
-    response = UrlFetchApp.fetch(config.apiUrl, requestOptions);
+    try { response = UrlFetchApp.fetch(profile.apiUrl, requestOptions); } catch (networkError) { throw new Error('JEV provider request failed.'); }
     const responseStatus = response.getResponseCode();
     if ((responseStatus === 429 || responseStatus === 529) && attempt + 1 < config.advanced.providerAttempts) {
       const delay = config.advanced.initialRetryDelayMs * Math.pow(2, attempt);
@@ -1006,7 +1026,7 @@ function classifyThreadBatch_(items, config, metrics) {
       } catch (ignoredBodyReadError) {
         // Provider body diagnostics are best effort and never replace the HTTP error.
       }
-      addJevDiagnosticContextSafely_(error, { responseBody: responseBody });
+      addJevDiagnosticContextSafely_(error, { responseBody: redactJevKeys_(responseBody, config) });
     }
     throw error;
   }
@@ -1037,6 +1057,13 @@ function classifyThreadBatch_(items, config, metrics) {
   return items.map(function (item, index) {
     return { item: item, scores: scoresByItem[index] };
   });
+}
+
+function redactJevKeys_(text, config) {
+  let result = String(text || '');
+  (config && config.providers || []).forEach(function (p) { if (p.apiKey) result = result.split(p.apiKey).join('[redacted API key]'); });
+  if (config && config.apiKey) result = result.split(config.apiKey).join('[redacted API key]');
+  return result;
 }
 
 function getLabelIdsByName_(metrics) {
@@ -1141,7 +1168,7 @@ function flushJevThreadBatch_(items, config, labelIdsByName, metrics, summary, t
     error = addJevDiagnosticContextSafely_(error, { processingPhase: 'classification' });
     items.forEach(function (item) {
       summary.failed += 1;
-      logThreadProcessingError_(item.threadId, error, config.apiKey);
+      logThreadProcessingError_(item.threadId, error, config);
     });
     if (isJevRateLimitError_(error)) {
       summary.stopped = true;
@@ -1165,7 +1192,7 @@ function flushJevThreadBatch_(items, config, labelIdsByName, metrics, summary, t
         break;
       }
       summary.failed += 1;
-      logThreadProcessingError_(classification.item.threadId, error, config.apiKey);
+      logThreadProcessingError_(classification.item.threadId, error, config);
       if (isJevRateLimitError_(error)) {
         const diagnosticContext = getJevPropertySafely_(error, 'jevDiagnosticContext');
         const processingPhase = getJevPropertySafely_(diagnosticContext, 'processingPhase');

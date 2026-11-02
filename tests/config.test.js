@@ -82,8 +82,54 @@ test('legacy properties migrate without losing existing provider and schedule va
   assert.equal(config.intervalMinutes, 15);
   assert.equal(config.model, 'legacy-model');
   assert.equal(config.apiUrl, 'https://provider.example/v2');
+  assert.deepEqual(JSON.parse(JSON.stringify(config.providers)), [{ id: 'provider-1', apiUrl: 'https://provider.example/v2', model: 'legacy-model', apiKey: 'legacy-key' }]);
   assert.equal(config.fallbackLabel, 'Jev-Uncategoried');
   assert.equal(config.categories.length, 9);
+});
+
+test('provider profiles preserve ordered identities and validate count, IDs, URLs, models, and keys', function () {
+  const harness = makeConfigHarness();
+  const config = defaultConfig(harness);
+  config.providers = [
+    { id: 'first_profile', apiUrl: 'https://one.example/v1', model: ' model-one ', apiKey: ' key-one ' },
+    { id: 'second-profile', apiUrl: 'https://two.example/v2', model: 'model-two', apiKey: '' },
+  ];
+  const normalized = JSON.parse(harness.evaluate('JSON.stringify(validateJevConfig_(' + JSON.stringify(config) + '))'));
+  assert.deepEqual(normalized.providers.map((p) => p.id), ['first_profile', 'second-profile']);
+  assert.equal(normalized.providers[0].model, 'model-one');
+  assert.equal(normalized.providers[0].apiKey, 'key-one');
+  assert.equal(normalized.model, 'model-one');
+
+  const invalid = JSON.parse(JSON.stringify(config));
+  invalid.providers = Array.from({ length: 6 }, (_, i) => ({ id: 'p' + i, apiUrl: 'https://p.example/v1', model: 'm', apiKey: '' }));
+  assert.throws(() => harness.evaluate('validateJevConfig_(' + JSON.stringify(invalid) + ')'), /validation failed/);
+  for (const badProfiles of [
+    [{ id: 'same', apiUrl: 'https://a.example', model: 'm', apiKey: '' }, { id: 'same', apiUrl: 'https://b.example', model: 'm', apiKey: '' }],
+    [{ id: 'bad id', apiUrl: 'https://a.example', model: 'm', apiKey: '' }],
+    [{ id: 'constructor', apiUrl: 'https://a.example', model: 'm', apiKey: '' }],
+    [{ id: 'p', apiUrl: 'http://a.example', model: 'm', apiKey: '' }],
+    [{ id: 'p', apiUrl: 'https://a.example', model: ' ', apiKey: '' }],
+    [{ id: 'p', apiUrl: 'https://a.example', model: 'm', apiKey: null }],
+  ]) {
+    const candidate = defaultConfig(harness);
+    candidate.providers = badProfiles;
+    assert.throws(() => harness.evaluate('validateJevConfig_(' + JSON.stringify(candidate) + ')'), /validation failed/);
+  }
+});
+
+test('legacy top-level credentials synthesize a stable provider profile when profiles are absent', function () {
+  const harness = makeConfigHarness();
+  const config = defaultConfig(harness);
+  delete config.providers;
+  config.apiUrl = 'https://legacy.example/v1';
+  config.model = 'legacy-model';
+  config.apiKey = 'legacy-secret';
+  const migrated = JSON.parse(harness.evaluate('JSON.stringify(validateJevConfig_(' + JSON.stringify(config) + '))'));
+  assert.equal(migrated.providers.length, 1);
+  assert.equal(migrated.providers[0].id, 'provider-1');
+  assert.equal(migrated.providers[0].apiUrl, config.apiUrl);
+  assert.equal(migrated.providers[0].model, config.model);
+  assert.equal(migrated.providers[0].apiKey, config.apiKey);
 });
 
 test('UTF-8 configuration chunks stay within the per-property byte limit', function () {
