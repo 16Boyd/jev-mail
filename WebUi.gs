@@ -129,7 +129,6 @@ function saveJevSettings(request) {
     if (!rawSettings.schedule || Object.keys(rawSettings.schedule).some(function (k) { return ['weekdays', 'startTime', 'endTime', 'timeZone'].indexOf(k) < 0; })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'schedule', message: 'Schedule includes unsupported fields.' }] };
     if (!rawSettings.advanced || Object.keys(rawSettings.advanced).some(function (k) { return ['maxThreadsToFetch', 'maxThreadsToClassify', 'batchTargetTokens', 'maxRequestTokens', 'maxStateQuestionTokens', 'providerAttempts', 'initialRetryDelayMs', 'gmailSpacingMs', 'cooldownMinutes'].indexOf(k) < 0; })) return { ok: false, code: 'VALIDATION', errors: [{ path: 'advanced', message: 'Advanced settings include unsupported fields.' }] };
     next.advanced = rawSettings.advanced;
-    if (!next.providers) next.apiKey = action === 'replace' ? String(request.apiKey || '').trim() : action === 'clear' ? '' : current.apiKey;
     const validated = validateJevConfig_(next, { apiKeyAction: action });
     commitJevConfig_(validated);
     let schedulePending = false;
